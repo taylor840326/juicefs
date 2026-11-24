@@ -106,6 +106,16 @@ func (m *Manager) warnf(format string, args ...interface{}) {
 	logger.Warnf(format, args...)
 }
 
+// canceled reports whether ctx was canceled. The FUSE context of JuiceFS
+// reports EINTR from Err() by design and exposes cancellation through
+// Canceled() instead, so Err() alone must not be used here.
+func canceled(ctx context.Context) bool {
+	if c, ok := ctx.(interface{ Canceled() bool }); ok {
+		return c.Canceled()
+	}
+	return ctx.Err() != nil
+}
+
 // Charge blocks until op is allowed by the policy and consumes its tokens.
 // A nil scope or an empty chain means "no policy", i.e. unlimited.
 func (m *Manager) Charge(ctx context.Context, s *Scope, op Op) error {
@@ -140,8 +150,8 @@ func (m *Manager) waitLocal(ctx context.Context, key string, rate uint64, n int6
 	burst := burstFor(rate)
 	b := m.tokenBucket(key, rate, burst)
 	for n > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
+		if canceled(ctx) {
+			return context.Canceled
 		}
 		chunk := n
 		if chunk > int64(burst) {
@@ -158,11 +168,10 @@ func (m *Manager) waitLocal(ctx context.Context, key string, rate uint64, n int6
 		if wait <= 0 {
 			wait = time.Millisecond
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
+		// A plain sleep keeps this safe for contexts that do not implement
+		// Done() (the FUSE context does not); cancellation is checked at the
+		// top of the loop, at most one wait slice later.
+		time.Sleep(wait)
 	}
 	return nil
 }
@@ -195,8 +204,8 @@ func (m *Manager) waitLeased(ctx context.Context, chain []Level, idx int, dim st
 	key := keyOf(chain[idx].Ino, dim)
 	b := m.tokenBucket(key, 0, burst) // leased buckets never refill on their own
 	for n > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
+		if canceled(ctx) {
+			return context.Canceled
 		}
 		chunk := n
 		if chunk > int64(burst) {
@@ -227,11 +236,7 @@ func (m *Manager) waitLeased(ctx context.Context, chain []Level, idx int, dim st
 			b.add(granted)
 			continue
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(20 * time.Millisecond):
-		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	return nil
 }
