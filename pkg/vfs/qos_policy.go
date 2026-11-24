@@ -76,7 +76,7 @@ func (v *VFS) SetQoSPolicy(p *qos.Policy) {
 	}
 	if p != nil {
 		logger.Infof("QoS policy loaded: tenant=%s version=%d epoch=%d rules=%d",
-			p.Tenant, p.Version, p.Epoch, len(p.Rules))
+			p.Tenant, p.Version, v.qosEpoch.Load(), len(p.Rules))
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -64,7 +65,21 @@ type Manager struct {
 	// (inode, dimension) pair: one mount talking to the counter service
 	// must not turn every blocked operation into an HTTP round trip.
 	flights sync.Map // key -> *leaseFlight
+
+	// leaseDownUntil is the unix nanosecond time until which a fail-open
+	// manager skips lease requests after the counter service was
+	// unreachable, so an outage does not slow down every I/O operation.
+	leaseDownUntil atomic.Int64
 }
+
+var (
+	// leaseGrantBudget bounds how long a fail-open manager waits for one
+	// grant series before letting the operation through.
+	leaseGrantBudget = 3 * time.Second
+	// leaseCooldown is how long a fail-open manager stops asking the
+	// counter service after a grant failed.
+	leaseCooldown = 30 * time.Second
+)
 
 // leaseFlight is one in-flight grant request shared by all goroutines that
 // are waiting for tokens of the same bucket.
@@ -235,6 +250,9 @@ func (m *Manager) waitLocal(ctx context.Context, key string, rate uint64, n int6
 // grant request carries the whole chain, so the counter deducts every
 // ancestor tokenBucket at once; charging ancestors again here would double count.
 func (m *Manager) chargeLeased(ctx context.Context, s *Scope, op Op, stale func() bool) error {
+	if m.failOpen && time.Now().UnixNano() < m.leaseDownUntil.Load() {
+		return nil
+	}
 	handled := make(map[string]bool, 4)
 	for i, lv := range s.Chain {
 		for _, dr := range lv.Limits.dimensionReqs(op) {
@@ -285,15 +303,27 @@ func (m *Manager) waitLeased(ctx context.Context, chain []Level, idx int, dim st
 			continue
 		}
 		want := int64(quantum)
-		granted, err := m.grantLease(ctx, key, b, func(ctx context.Context) (int64, error) {
+		grantCtx := ctx
+		var cancel context.CancelFunc
+		if m.failOpen {
+			grantCtx, cancel = context.WithTimeout(ctx, leaseGrantBudget)
+		}
+		granted, err := m.grantLease(grantCtx, key, b, func(ctx context.Context) (int64, error) {
 			return m.lease.Grant(ctx, m.tenant, levels, dim, want)
 		})
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			if m.failOpen {
+				m.leaseDownUntil.Store(time.Now().Add(leaseCooldown).UnixNano())
 				m.warnf("QoS lease service unavailable (%s), letting %s through: %d", dim, m.tenant, n)
 				return nil
 			}
 			return err
+		}
+		if m.failOpen {
+			m.leaseDownUntil.Store(0)
 		}
 		if granted > 0 {
 			// One request delivers at most one quantum; if the counter could

@@ -45,18 +45,25 @@ type LeaseClient interface {
 
 // HTTPLeaseClient is the default LeaseClient: it talks to juicefs qosd.
 type HTTPLeaseClient struct {
-	URL   string
-	Token string
-	HTTP  *http.Client
+	URL     string
+	Token   string
+	HTTP    *http.Client
+	Retries int
 }
 
 // NewHTTPLeaseClient creates a client for the counter service at url. An
-// empty token means the service does not require authentication.
-func NewHTTPLeaseClient(url, token string) *HTTPLeaseClient {
+// empty token means the service does not require authentication. retries is
+// the number of retries after a failed request, in the same spirit as
+// --io-retries (0 disables retrying).
+func NewHTTPLeaseClient(url, token string, retries int) *HTTPLeaseClient {
+	if retries < 0 {
+		retries = 0
+	}
 	return &HTTPLeaseClient{
-		URL:   strings.TrimRight(url, "/"),
-		Token: token,
-		HTTP:  &http.Client{Timeout: 5 * time.Second},
+		URL:     strings.TrimRight(url, "/"),
+		Token:   token,
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		Retries: retries,
 	}
 }
 
@@ -80,6 +87,30 @@ func (c *HTTPLeaseClient) Grant(ctx context.Context, tenant string, levels []Lea
 	if err != nil {
 		return 0, err
 	}
+	attempts := c.Retries + 1
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			wait := RetryDelay(i)
+			logger.Warnf("qos: lease grant to %s failed: %s; retry %d/%d in %s", c.URL, lastErr, i, c.Retries, wait)
+			if !sleepWithCancel(ctx, wait) {
+				return 0, context.Canceled
+			}
+		}
+		n, err := c.grantOnce(ctx, body)
+		if err == nil {
+			return n, nil
+		}
+		lastErr = err
+		if !Retryable(err) {
+			return 0, err
+		}
+	}
+	logger.Warnf("qos: lease grant to %s failed after %d attempts: %s", c.URL, attempts, lastErr)
+	return 0, fmt.Errorf("lease grant: %s (after %d attempts)", lastErr, attempts)
+}
+
+func (c *HTTPLeaseClient) grantOnce(ctx context.Context, body []byte) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL+"/v1/grant", bytes.NewReader(body))
 	if err != nil {
 		return 0, err
@@ -95,7 +126,7 @@ func (c *HTTPLeaseClient) Grant(ctx context.Context, tenant string, levels []Lea
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("lease grant: %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return 0, &HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
 	}
 	var out grantResponse
 	if err := json.Unmarshal(data, &out); err != nil {

@@ -78,6 +78,13 @@
 |`--qos-iops=0` <VersionAdd>1.4</VersionAdd>|数据操作（read、write、copy_file_range）每秒次数上限，默认 0 表示不限制。|
 |`--qos-meta-iops=0` <VersionAdd>1.4</VersionAdd>|元数据操作（lookup、getattr、create、unlink、readdir、statfs 等）每秒次数上限，默认 0 表示不限制。|
 |`--qos-config` <VersionAdd>1.4</VersionAdd>|QoS 配置文件路径（JSON）。挂载时读取一次，之后每次收到 `SIGUSR1` 信号都会重新读取并生效，默认空表示不使用配置文件。|
+|`--qos-policy-file` <VersionAdd>1.4</VersionAdd>|租户 QoS 策略文件路径（JSON，含 `tenant`、`cap`、`rules`）。挂载时解析路径，之后每 3 秒检查文件内容（sha256）变化并自动重载，默认空表示不使用。|
+|`--qos-server` <VersionAdd>1.4</VersionAdd>|QoS 控制服务（qosd）地址。设置后挂载进程每 3 秒请求 `/v1/policies/{volume}` 拉取本卷策略，默认空表示不启用。|
+|`--qos-server-token` <VersionAdd>1.4</VersionAdd>|访问 QoS 控制服务的令牌，也可通过环境变量 `JFS_QOS_SERVER_TOKEN` 设置，默认空表示服务端未开启鉴权。|
+|`--qos-lease-url` <VersionAdd>1.4</VersionAdd>|QoS 共享计数服务地址（通常与 `--qos-server` 相同）。多个挂载进程通过它共享租户预算，默认空表示各挂载独立计数。|
+|`--qos-lease-token` <VersionAdd>1.4</VersionAdd>|访问共享计数服务的令牌，默认空表示服务端未开启鉴权。|
+|`--qos-fail-open` <VersionAdd>1.4</VersionAdd>|共享计数服务不可用时是否放行 I/O，默认 `true`；设为 `false` 时请求会返回 `EINTR`/`EIO`。|
+|`--qos-retries=0` <VersionAdd>1.4</VersionAdd>|访问 QoS 服务失败后的重试次数，默认 0 表示沿用 `--io-retries` 的值；重试间隔与 `--io-retries` 一致（300ms 递增，最长 10s）。|
 |`--qos-http-token` <VersionAdd>1.4</VersionAdd>|QoS HTTP API 的访问令牌。设置后，监控地址上的 `/api/qos` 可用该令牌查询或修改限制；为空时该接口返回 403。也可以通过环境变量 `JFS_QOS_HTTP_TOKEN` 设置，默认空表示不启用。|
 
 当 `--qos-bandwidth` 与 `--qos-read-bandwidth`/`--qos-write-bandwidth` 同时设置时，对应方向只按方向额度计费；例如只设置 `--qos-read-bandwidth=500M` 时，读请求受 500 MiB/s 限制，写请求不受限制。带宽限制按经过 FUSE 的数据量计算，命中内核页缓存的读不会计入；观测实际吞吐请以 `juicefs stats` 或监控指标中的读写速率为准。
@@ -116,6 +123,8 @@ QoS 限制支持在挂载后动态调整，无需卸载或重启挂载进程：
     -d '{"bandwidth":"100M","metaIOPS":1000}' http://127.0.0.1:9567/api/qos
   ```
   该接口只由 `mount` 模式注册；`--metrics` 默认监听 `127.0.0.1`，如果改为监听 `0.0.0.0`，请设置足够强的令牌，并通过网络策略或反向代理限制访问来源。
+
+连接 QoS 控制服务（`--qos-server`）或共享计数服务（`--qos-lease-url`）失败时会自动重试：重试次数由 `--qos-retries` 控制（默认沿用 `--io-retries`，即默认 10 次），重试间隔与 `--io-retries` 一致（300ms 递增，单次最长 10s）；带 `--qos-server` 时每 3 秒的轮询本身也会持续重连。重试期间继续使用上一份生效策略；计数服务最终不可用时由 `--qos-fail-open` 决定放行（默认）还是报错。fail-open 模式下单个租约请求最多等待 3 秒，失败后 30 秒内不再请求计数服务（避免宕机时每个 I/O 都被重试拖慢），期间 I/O 直接放行；fail-closed 模式下则完整重试后再报错。
 
 `juicefs qos` 与 `--qos-config` 都只调整对应挂载进程自身的限制；共享同一个挂载进程的多个 Pod 共用这一份额度。
 

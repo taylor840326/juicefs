@@ -78,6 +78,13 @@ Client QoS limits are enforced at the request entry of a single mount process an
 |`--qos-iops=0` <VersionAdd>1.4</VersionAdd>|max number of data operations (read, write, copy_file_range) per second (default: 0, unlimited)|
 |`--qos-meta-iops=0` <VersionAdd>1.4</VersionAdd>|max number of metadata operations (lookup, getattr, create, unlink, readdir, statfs, ...) per second (default: 0, unlimited)|
 |`--qos-config` <VersionAdd>1.4</VersionAdd>|path of a JSON file with QoS limits; it is read at mount time and reloaded on every `SIGUSR1` signal (default: "", disabled)|
+|`--qos-policy-file` <VersionAdd>1.4</VersionAdd>|path of the tenant QoS policy (JSON with `tenant`, `cap` and `rules`); rule paths are resolved at mount time and the file is re-read when its sha256 changes (checked every 3s) (default: "", disabled)|
+|`--qos-server` <VersionAdd>1.4</VersionAdd>|URL of the QoS control service (qosd); the mount fetches `/v1/policies/{volume}` every 3s for its policy (default: "", disabled)|
+|`--qos-server-token` <VersionAdd>1.4</VersionAdd>|bearer token for the QoS control service; it can also be set with the `JFS_QOS_SERVER_TOKEN` environment variable (default: "")|
+|`--qos-lease-url` <VersionAdd>1.4</VersionAdd>|URL of the QoS counter service used to share the tenant budget between mounts (usually the same qosd); empty means each mount counts independently (default: "")|
+|`--qos-lease-token` <VersionAdd>1.4</VersionAdd>|bearer token for the QoS counter service (default: "")|
+|`--qos-fail-open` <VersionAdd>1.4</VersionAdd>|let I/O through when the counter service is unavailable (default: true); when false requests fail with `EINTR`/`EIO`|
+|`--qos-retries=0` <VersionAdd>1.4</VersionAdd>|number of retries after a failed QoS service request; 0 (default) uses the `--io-retries` value; the backoff is the same as `--io-retries` (300ms steps, capped at 10s)|
 |`--qos-http-token` <VersionAdd>1.4</VersionAdd>|token required by the QoS HTTP API served on the metrics address; when empty the `/api/qos` endpoint answers 403. It can also be set with the `JFS_QOS_HTTP_TOKEN` environment variable (default: "", disabled)|
 
 When `--qos-bandwidth` is used together with `--qos-read-bandwidth` or `--qos-write-bandwidth`, that direction is charged against its own quota only; for example with only `--qos-read-bandwidth=500M`, reads are limited to 500 MiB/s while writes stay unlimited. The bandwidth limit counts data delivered through FUSE, so reads served by the kernel page cache are not counted; use `juicefs stats` or metrics to observe the actual throughput.
@@ -116,6 +123,8 @@ The limits can be changed after mounting, without unmounting or restarting the c
     -d '{"bandwidth":"100M","metaIOPS":1000}' http://127.0.0.1:9567/api/qos
   ```
   The endpoint is only registered by `mount` processes. `--metrics` listens on `127.0.0.1` by default; if it is changed to `0.0.0.0`, use a strong token and restrict the source with network policies or a reverse proxy.
+
+Failing requests to the QoS control service (`--qos-server`) or the counter service (`--qos-lease-url`) are retried: `--qos-retries` sets the retry count (0, the default, uses `--io-retries`, i.e. 10 attempts), and the backoff follows `--io-retries` (300ms steps, capped at 10s). With `--qos-server` the 3s poll keeps reconnecting as well; the last valid policy stays in effect while retries are pending, and when the counter service is finally unavailable `--qos-fail-open` decides whether I/O is allowed (default) or fails with an error. In fail-open mode one lease request waits at most 3s, and after a failure the counter service is not contacted again for 30s (I/O is let through meanwhile), so an outage does not slow down every operation; fail-closed mode still runs the full retry series before failing.
 
 Both `juicefs qos` and `--qos-config` only change the limits of the mount process they target; multiple Pods sharing one mount process share the same quota.
 

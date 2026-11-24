@@ -370,6 +370,11 @@ func qosFlags() []cli.Flag {
 			Name:  "qos-server-token",
 			Usage: "bearer token for the QoS control service (can also be set with JFS_QOS_SERVER_TOKEN)",
 		},
+		&cli.IntFlag{
+			Name:  "qos-retries",
+			Value: 0,
+			Usage: "number of retries after a failed QoS service request, with the same backoff as --io-retries (default: the --io-retries value)",
+		},
 	})
 }
 

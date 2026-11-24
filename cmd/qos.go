@@ -403,12 +403,38 @@ func fetchAndApplyRemotePolicy(v *vfs.VFS, force bool) error {
 }
 
 // fetchRemotePolicy downloads one policy snapshot. A 404 means the control
-// service has no policy for the volume (no limits).
+// service has no policy for the volume (no limits). Transient failures are
+// retried with the same backoff as --io-retries; the retry count defaults to
+// the --io-retries value (see --qos-retries).
 func fetchRemotePolicy(volume string) (*qos.Policy, error) {
 	if qosServer == "" {
 		return nil, nil
 	}
 	endpoint := strings.TrimRight(qosServer, "/") + "/v1/policies/" + url.PathEscape(volume)
+	attempts := qosRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			wait := qos.RetryDelay(i)
+			logger.Warnf("fetch QoS policy from %s failed: %s; retry %d/%d in %s", endpoint, lastErr, i, qosRetries, wait)
+			time.Sleep(wait)
+		}
+		p, err := fetchRemotePolicyOnce(endpoint)
+		if err == nil {
+			return p, nil
+		}
+		lastErr = err
+		if !qos.Retryable(err) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("%s (after %d attempts)", lastErr, attempts)
+}
+
+func fetchRemotePolicyOnce(endpoint string) (*qos.Policy, error) {
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -433,7 +459,7 @@ func fetchRemotePolicy(volume string) (*qos.Policy, error) {
 		return nil, nil
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &qos.HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 }
 

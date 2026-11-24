@@ -101,6 +101,7 @@ juicefs mount sqlite3:///data/meta.db /mnt/jfs \
 
 - 卷名取自元数据中的 `Format.Name`，客户端请求 `/v1/policies/{volume}`；`404` 表示该卷未配置策略（不限速），之后按返回的 JSON 生效。
 - 拉取周期 3 秒；`version` 未变不重载、不递增 epoch。`SIGUSR1` 触发立即拉取（运维提速用）。
+- 连接失败自动重试：`--qos-retries` 控制重试次数（默认沿用 `--io-retries`），退避与 `--io-retries` 一致（300ms 递增、单次上限 10s）；策略拉取失败时继续使用上一份策略，3 秒轮询本身也会持续重连。租约请求同样按该策略重试，仍失败时由 `--qos-fail-open` 决定放行或报错；fail-open 下租约请求有 3 秒总预算，失败后进入 30 秒冷却期（冷却期内不再请求计数服务、I/O 直接放行），避免计数服务宕机时每个 I/O 都被重试拖慢。
 - 本地文件模式仍保留（`--qos-policy-file` / `--qos-config`）；同时配置 `--qos-server` 时以服务端为准。
 - 策略 JSON 与本地文件同构：`tenant`、`volume`、`version`、`cap`、`rules[]`。路径规则在挂载端解析为 inode（`--subdir` 挂载以挂载根为界）。
 - 客户端级 `--qos-bandwidth` 等旧参数继续可用，与策略叠加。

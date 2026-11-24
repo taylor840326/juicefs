@@ -263,7 +263,7 @@ func TestLeaseSharedBudgets(t *testing.T) {
 	defer srv.Close()
 
 	levels := []LeaseLevel{{Ino: 0, Rate: 1000}}
-	client := NewHTTPLeaseClient(srv.URL, "token-mismatch")
+	client := NewHTTPLeaseClient(srv.URL, "token-mismatch", 2)
 	m := NewManager("t1", client, false)
 	s := &Scope{Chain: []Level{{Ino: 0, Limits: Limits{Bandwidth: 1000}}}}
 	if err := m.Charge(context.Background(), s, Op{Bytes: 10}); err == nil {
@@ -279,7 +279,7 @@ func TestLeaseSharedBudgets(t *testing.T) {
 
 func TestLeaseFailOpen(t *testing.T) {
 	s := &Scope{Chain: []Level{{Ino: 0, Limits: Limits{Bandwidth: 1 << 20}}}}
-	bad := NewHTTPLeaseClient("http://127.0.0.1:1", "")
+	bad := NewHTTPLeaseClient("http://127.0.0.1:1", "", 2)
 	if err := NewManager("t1", bad, true).Charge(context.Background(), s, Op{Bytes: 1 << 20}); err != nil {
 		t.Fatalf("fail-open must not error: %v", err)
 	}

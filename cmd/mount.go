@@ -299,9 +299,20 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 	}
 	qosPolicy, qosMgr = nil, nil
 	qosFailOpen = c.Bool("qos-fail-open")
+	qosRetries = c.Int("qos-retries")
+	if !c.IsSet("qos-retries") || qosRetries == 0 {
+		// --qos-retries defaults to the io-retries value, so a mount that
+		// already tunes its network retries gets the same behaviour when
+		// talking to the QoS service.
+		qosRetries = c.Int("io-retries")
+	}
+	if qosRetries < 0 {
+		logger.Warnf("qos-retries should not be negative, ignored: %d", qosRetries)
+		qosRetries = 0
+	}
 	qosLease = nil
 	if u := c.String("qos-lease-url"); u != "" {
-		qosLease = qos.NewHTTPLeaseClient(u, c.String("qos-lease-token"))
+		qosLease = qos.NewHTTPLeaseClient(u, c.String("qos-lease-token"), qosRetries)
 	}
 	tenant := ""
 	if path := c.String("qos-policy-file"); path != "" {
@@ -608,6 +619,9 @@ var (
 	qosServer      string
 	qosServerToken string
 	qosVolume      string
+	// qosRetries is the number of retries after a failed QoS service
+	// request. It defaults to the --io-retries value.
+	qosRetries int
 )
 
 // qosLease is shared by every manager built for this mount; qosMgrTenant
