@@ -86,6 +86,11 @@ func (v *VFS) SetQoSManager(m *qos.Manager) {
 	v.qosMgr = m
 }
 
+// GetQoSManager returns the limiter used for policy based QoS, or nil.
+func (v *VFS) GetQoSManager() *qos.Manager {
+	return v.qosMgr
+}
+
 // GetQoSPolicy returns the current policy snapshot, or nil.
 func (v *VFS) GetQoSPolicy() *qos.Policy {
 	return v.qosPolicy.Load()

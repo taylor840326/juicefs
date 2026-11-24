@@ -298,19 +298,27 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		cfg.QoS = qosConf
 	}
 	qosPolicy, qosMgr = nil, nil
+	qosFailOpen = c.Bool("qos-fail-open")
+	qosLease = nil
+	if u := c.String("qos-lease-url"); u != "" {
+		qosLease = qos.NewHTTPLeaseClient(u, c.String("qos-lease-token"))
+	}
+	tenant := ""
 	if path := c.String("qos-policy-file"); path != "" {
 		if p, err := qos.LoadPolicyFile(path); err != nil {
 			logger.Warnf("load QoS policy %s: %s", path, err)
 		} else {
 			qosPolicy = p
-			var lease qos.LeaseClient
-			if u := c.String("qos-lease-url"); u != "" {
-				lease = qos.NewHTTPLeaseClient(u, c.String("qos-lease-token"))
-			}
-			qosMgr = qos.NewManager(p.Tenant, lease, c.Bool("qos-fail-open"))
-			logger.Infof("QoS policy enabled: tenant=%s version=%d rules=%d shared-budget=%v",
-				p.Tenant, p.Version, len(p.Rules), lease != nil)
+			tenant = p.Tenant
 		}
+	}
+	if tenant == "" {
+		tenant = "default"
+	}
+	if qosPolicy != nil || qosLease != nil || c.String("qos-server") != "" {
+		qosMgr = qos.NewManager(tenant, qosLease, qosFailOpen)
+		logger.Infof("QoS manager enabled: tenant=%s policy=%v shared-budget=%v fail-open=%v",
+			tenant, qosPolicy != nil, qosLease != nil, qosFailOpen)
 	}
 
 	skip_check := os.Getenv("SKIP_BACKUP_META_CHECK") == "true"
@@ -593,6 +601,24 @@ var qosConfigFile string
 // clients of the tenant and is reloaded on SIGUSR1.
 var qosPolicyFile string
 
+// qosServer, qosServerToken and qosVolume configure polling of the QoS control
+// service: the mount fetches /v1/policies/{volume} every 3s instead of reading a
+// local policy file.
+var (
+	qosServer      string
+	qosServerToken string
+	qosVolume      string
+)
+
+// qosLease is shared by every manager built for this mount; qosMgrTenant
+// remembers which tenant the current manager charges, so a policy reload with a
+// different tenant rebuilds it.
+var (
+	qosLease     qos.LeaseClient
+	qosFailOpen  bool
+	qosMgrTenant string
+)
+
 // qosPolicy and qosMgr are the policy snapshot and the limiter of the current
 // mount process. They are built in getVfsConf and installed after NewVFS.
 var (
@@ -612,6 +638,11 @@ func mount(c *cli.Context) error {
 	setup(c, 2)
 	qosConfigFile = c.String("qos-config")
 	qosPolicyFile = c.String("qos-policy-file")
+	qosServer = strings.TrimRight(c.String("qos-server"), "/")
+	qosServerToken = c.String("qos-server-token")
+	if qosServerToken == "" {
+		qosServerToken = os.Getenv("JFS_QOS_SERVER_TOKEN")
+	}
 	addr := c.Args().Get(0)
 	removePassword(addr)
 	mp := c.Args().Get(1)
@@ -676,6 +707,7 @@ func mount(c *cli.Context) error {
 
 	chunkConf := getChunkConf(c, format)
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
+	qosVolume = vfsConf.Format.Name
 	setFuseOption(c, format, vfsConf)
 	if stage == 0 || stage == 3 {
 		blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))

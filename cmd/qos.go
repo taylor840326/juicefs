@@ -21,7 +21,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -194,6 +198,12 @@ func printQoS(conf *qos.Config) {
 // It is triggered by SIGUSR1, which lets operators tune the limits of a mount
 // without restarting it (for example after a ConfigMap update).
 func reloadQoS(v *vfs.VFS) {
+	if qosServer != "" {
+		if err := fetchAndApplyRemotePolicy(v, true); err != nil {
+			logger.Warnf("reload QoS policy from %s: %s", qosServer, err)
+		}
+		return
+	}
 	if qosConfigFile == "" && qosPolicyFile == "" {
 		logger.Warnf("received SIGUSR1 but neither --qos-config nor --qos-policy-file is set, ignore")
 		return
@@ -250,6 +260,10 @@ const qosWatchInterval = 3 * time.Second
 // changed. Files are compared by content hash, so a touched but unchanged file
 // does not bump the policy epoch and does not disturb running I/O.
 func watchQoS(v *vfs.VFS) {
+	if qosServer != "" {
+		watchRemoteQoS(v)
+		return
+	}
 	files := []string{qosConfigFile, qosPolicyFile}
 	last := make(map[string][sha256.Size]byte, 2)
 	for _, p := range files {
@@ -279,6 +293,147 @@ func watchQoS(v *vfs.VFS) {
 				applyQoSPolicy(v, p)
 			}
 		}
+	}
+}
+
+// ensureQoSManager (re)builds the limiter when the policy arrives from the
+// control service or when its tenant changed, so the shared budget is charged to
+// the right tenant.
+func ensureQoSManager(v *vfs.VFS, tenant string) {
+	if v.GetQoSManager() != nil && qosMgrTenant == tenant {
+		return
+	}
+	qosMgr = qos.NewManager(tenant, qosLease, qosFailOpen)
+	qosMgrTenant = tenant
+	v.SetQoSManager(qosMgr)
+	logger.Infof("QoS manager enabled: tenant=%s shared-budget=%v fail-open=%v", tenant, qosLease != nil, qosFailOpen)
+}
+
+// watchRemoteQoS polls the control service for the policy of the mounted
+// volume. The policy document is the same JSON the mount used to read from
+// --qos-policy-file; rule paths are resolved locally against the namespace.
+func watchRemoteQoS(v *vfs.VFS) {
+	if qosVolume == "" {
+		logger.Warnf("--qos-server is set but the volume name is unknown; QoS policy is not fetched")
+		return
+	}
+	endpoint := strings.TrimRight(qosServer, "/") + "/v1/policies/" + url.PathEscape(qosVolume)
+	var lastVersion uint64
+	var havePolicy bool
+	var lastErr string
+	var lastErrAt time.Time
+	apply := func(p *qos.Policy) {
+		if p == nil {
+			return
+		}
+		if err := p.ResolvePaths(func(path string) (uint64, error) {
+			return lookupMetaPath(v.Meta, path)
+		}, logger.Warnf); err != nil {
+			logger.Warnf("resolve QoS policy paths: %s", err)
+		}
+		ensureQoSManager(v, p.Tenant)
+		v.SetQoSPolicy(p)
+		qosPolicy = p
+		havePolicy = true
+		logger.Infof("QoS policy loaded from %s (volume=%s version=%d rules=%d)",
+			endpoint, qosVolume, p.Version, len(p.Rules))
+	}
+	poll := func() {
+		p, err := fetchRemotePolicy(qosVolume)
+		if err != nil {
+			msg := err.Error()
+			if msg != lastErr || time.Since(lastErrAt) >= time.Minute {
+				lastErr, lastErrAt = msg, time.Now()
+				logger.Warnf("fetch QoS policy from %s: %s", endpoint, msg)
+			}
+			return
+		}
+		lastErr = ""
+		if p == nil {
+			if havePolicy || qosPolicy != nil {
+				v.SetQoSPolicy(nil)
+				qosPolicy = nil
+				havePolicy = false
+				lastVersion = 0
+				logger.Infof("QoS policy for volume %s removed by the control service", qosVolume)
+			}
+			return
+		}
+		if havePolicy && p.Version == lastVersion {
+			return
+		}
+		apply(p)
+		lastVersion = p.Version
+	}
+	poll()
+	ticker := time.NewTicker(qosWatchInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		poll()
+	}
+}
+
+// fetchAndApplyRemotePolicy fetches the policy once. force applies it even
+// when the version did not change (used by SIGUSR1).
+func fetchAndApplyRemotePolicy(v *vfs.VFS, force bool) error {
+	p, err := fetchRemotePolicy(qosVolume)
+	if err != nil {
+		return err
+	}
+	if p == nil {
+		v.SetQoSPolicy(nil)
+		qosPolicy = nil
+		logger.Infof("QoS policy for volume %s is not defined on the control service", qosVolume)
+		return nil
+	}
+	if cur := v.GetQoSPolicy(); cur != nil && !force && cur.Version == p.Version {
+		return nil
+	}
+	if err := p.ResolvePaths(func(path string) (uint64, error) {
+		return lookupMetaPath(v.Meta, path)
+	}, logger.Warnf); err != nil {
+		logger.Warnf("resolve QoS policy paths: %s", err)
+	}
+	ensureQoSManager(v, p.Tenant)
+	v.SetQoSPolicy(p)
+	qosPolicy = p
+	logger.Infof("QoS policy loaded from %s (volume=%s version=%d rules=%d)",
+		qosServer, qosVolume, p.Version, len(p.Rules))
+	return nil
+}
+
+// fetchRemotePolicy downloads one policy snapshot. A 404 means the control
+// service has no policy for the volume (no limits).
+func fetchRemotePolicy(volume string) (*qos.Policy, error) {
+	if qosServer == "" {
+		return nil, nil
+	}
+	endpoint := strings.TrimRight(qosServer, "/") + "/v1/policies/" + url.PathEscape(volume)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if qosServerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+qosServerToken)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if err != nil {
+			return nil, err
+		}
+		return qos.ParsePolicy(data)
+	case http.StatusNotFound:
+		return nil, nil
+	default:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 }
 

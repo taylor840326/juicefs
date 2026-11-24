@@ -11,7 +11,7 @@
 |---|---|---|
 | F1 卷级 QoS | `qos.Manager` + tenant `cap` | 策略里的 `cap` 是最后一道总闸，未命中任何规则的路径都继承它 |
 | F2 目录级 QoS | `pkg/vfs/qos_policy.go` `qosScope` | 从操作目标的 inode 向上找最近带规则的祖先，命中谁的规则就用谁的配额 |
-| F3 跨客户端共享 | `cmd/qosd.go` + `pkg/qos/lease.go` | 各挂载进程向同一个 `qosd` 按需申请令牌，父子桶一起扣，Σ 子目录 ≤ 租户 cap |
+| F3 跨客户端共享 | `cmd/qosd/main.go` + `pkg/qos/lease.go` | 各挂载进程向同一个 `qosd` 按需申请令牌，父子桶一起扣，Σ 子目录 ≤ 租户 cap |
 | F4 严格分区 | `Manager.chargeLocal` / `Counter.Grant` | 子规则的桶独立，顺序消耗；兄弟目录剩余额度不会被借用 |
 | F5 读写带宽 | `Limits.ReadBandwidth/WriteBandwidth` | 方向桶优先，未设置时回退到共享 `bandwidth` |
 | F6 数据 IOPS | `Limits.IOPS/ReadIOPS/WriteIOPS` | 每次数据操作先扣 1 个 IOPS，再按字节扣带宽 |
@@ -83,96 +83,136 @@ VFS.qosPolicy (atomic)          ── SIGUSR1：重读文件、重建 policy、
 
 ## 3. CLI 与装配
 
-```bash
-# 计数服务（每租户/平台一个，默认只监听本机）
-juicefs qosd --listen 127.0.0.1:19567 --token "$JFS_QOSD_TOKEN"
+qosd 是平台侧的 QoS 控制服务：策略存在 Redis，按 volume 提供增删改查接口，同时继续提供令牌租约（共享预算）。挂载只与 qosd 通信，不再需要本地策略文件。
 
-# 挂载：策略文件 + 租约 + fail-open
+```bash
+# 1) 控制服务（独立二进制；策略存 Redis）
+juicefs-qosd --listen 0.0.0.0:19567 --redis redis://127.0.0.1:6379/0 \
+  --token "$JFS_QOSD_TOKEN"
+
+# 2) 挂载：从 qosd 拉取本卷策略（每 3s），租约走同一服务
 juicefs mount sqlite3:///data/meta.db /mnt/jfs \
-  --qos-policy-file /etc/juicefs/policy.json \
-  --qos-lease-url http://127.0.0.1:19567 \
+  --qos-server http://qosd.internal:19567 \
+  --qos-server-token "$JFS_QOSD_TOKEN" \
+  --qos-lease-url http://qosd.internal:19567 \
   --qos-lease-token "$JFS_QOSD_TOKEN" \
   --qos-fail-open=true
 ```
 
-- 策略文件路径在**挂载时**读入，`SIGUSR1` 重读；CSI 场景用 ConfigMap 挂载 +
-  `kill -USR1` 即可热更新。
-- **自动刷新**：挂载进程每 **3 秒**轮询一次 `--qos-policy-file` / `--qos-config`，
-  按内容 hash 判断是否变化；变化才重载（未变化不递增 epoch，不打扰在跑的 I/O）。
-  因此即使忘记发 `SIGUSR1`，策略编辑也会在 3 秒内生效；`qos.sh` 仍会主动发信号，
-  让修改在毫秒级生效并立即校验日志。编辑策略时应写临时文件再 `rename` 覆盖，
-  避免读到半个文件；读到坏 JSON 时保留旧策略并在日志中告警一次。
-- 旧的客户端级参数（`--qos-bandwidth` 等）继续可用，与策略叠加；两者都未配置
-  时没有任何额外开销。
+- 卷名取自元数据中的 `Format.Name`，客户端请求 `/v1/policies/{volume}`；`404` 表示该卷未配置策略（不限速），之后按返回的 JSON 生效。
+- 拉取周期 3 秒；`version` 未变不重载、不递增 epoch。`SIGUSR1` 触发立即拉取（运维提速用）。
+- 本地文件模式仍保留（`--qos-policy-file` / `--qos-config`）；同时配置 `--qos-server` 时以服务端为准。
+- 策略 JSON 与本地文件同构：`tenant`、`volume`、`version`、`cap`、`rules[]`。路径规则在挂载端解析为 inode（`--subdir` 挂载以挂载根为界）。
+- 客户端级 `--qos-bandwidth` 等旧参数继续可用，与策略叠加。
 
-### 3.1 独立 qosd 可执行程序
+### 3.1 qosd：多租户策略服务
 
-计数服务同时提供独立二进制，适合和挂载进程分开部署（sidecar 或平台共享服务）。
-它只依赖令牌桶计数器，不编译 FUSE、元数据引擎和对象存储客户端，体积约 7MB：
+**存储**（Redis）：
+
+| key | 内容 |
+|---|---|
+| `jfs:qos:policy:{volume}` | 策略 JSON（与本地 `policy.json` 同构） |
+| `jfs:qos:version:{volume}` | 版本计数器（服务端分配，写入时自增） |
+| `jfs:qos:volumes` | 卷索引（列表查询） |
+
+**HTTP API**（`/v1/healthz` 免鉴权，其余需要 token；错误返回 `{"error": "..."}`）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/v1/healthz` | 健康检查 |
+| GET | `/v1/policies` | 列出策略；`?tenant=t1` 过滤 |
+| GET | `/v1/policies/{volume}` | 取某卷策略；不存在返回 404 |
+| PUT | `/v1/policies/{volume}` | 创建/整体替换策略（version 由服务端递增） |
+| DELETE | `/v1/policies/{volume}` | 删除策略 |
+| GET | `/v1/policies/{volume}/rules` | 规则列表 |
+| POST | `/v1/policies/{volume}/rules` | 新增规则（`path` 或 `ino` + `limits`，`id` 可省略） |
+| PUT | `/v1/policies/{volume}/rules/{id}` | 更新规则 |
+| DELETE | `/v1/policies/{volume}/rules/{id}` | 删除规则 |
+| POST | `/v1/grant` | 令牌租约（挂载进程使用） |
 
 ```bash
-# 单独编译（不依赖 juicefs 主二进制）
-make juicefs-qosd
-# 等价于：CGO_ENABLED=0 go build -ldflags="-s -w" -o juicefs-qosd ./cmd/qosd
-
-# 交叉编译 Linux 静态版本
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o juicefs-qosd-linux-amd64 ./cmd/qosd
+TOKEN=demo-token
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data @policy.json http://127.0.0.1:19567/v1/policies/mt-demo
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:19567/v1/policies/mt-demo
+curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"path":"proj-c","limits":{"bandwidth":10485760}}' \
+  http://127.0.0.1:19567/v1/policies/mt-demo/rules
 ```
 
-参数：
+写入方只需提供 `tenant`、`cap`、`rules`；`volume` 由路径填充，`version` 由服务端分配。同一 `path`/`ino` 重复返回 409。预算准入校验（`ValidateBudget`）尚未接到 API，属于 P1。
+
+**独立二进制参数**：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--listen` | `127.0.0.1:19567` | 监听地址；跨主机部署时用 `0.0.0.0:19567` 并配合 token 与网络隔离 |
-| `--token` | env `JFS_QOSD_TOKEN` | 校验 `Authorization: Bearer` / `X-JuiceFS-Token`；为空则跳过鉴权并打警告 |
-| `--log-level` | `info` | 日志级别，可选 `info`、`warn`、`debug`；非法值直接报错退出 |
+| `--listen` | `127.0.0.1:19567` | 监听地址；跨主机部署时配合 token 与网络隔离 |
+| `--redis` | env `JFS_QOSD_REDIS` | Redis DSN（`redis://host:port/db` 或 `host:port`），必填 |
+| `--token` | env `JFS_QOSD_TOKEN` | Bearer token；为空则跳过鉴权并打警告 |
+| `--log-level` | `info` | `info`/`warn`/`debug`，非法值退出码 2 |
 | `--version` | — | 打印版本后退出 |
 
 ```bash
-juicefs-qosd --listen 0.0.0.0:19567 --token "$JFS_QOSD_TOKEN" --log-level debug
-juicefs-qosd --log-level bogus
-# ERROR: invalid log level "bogus": must be one of info, warn, debug
+make juicefs-qosd
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o juicefs-qosd-linux-amd64 ./cmd/qosd
 ```
 
-`juicefs qosd` 子命令仍然保留，行为一致（日志级别用全局 `juicefs --log-level`）。
-测试脚本会自动优先使用 `juicefs-qosd`，找不到时回退到 `juicefs qosd`。
+**注意**：`juicefs qosd` 子命令已移除，qosd 只作为独立二进制发布。
 
 ### 3.2 qos.sh：策略运维助手
 
-测试包提供 `qos.sh`，用于查看和修改策略文件（`policy.json`），修改后自动向挂载进程发 `SIGUSR1` 完成热加载，无需重新挂载：
+`qos.sh` 直接操作 qosd 的 HTTP API（读 → 局部修改 → PUT → 等客户端加载），不再编辑本地文件：
 
 ```bash
-./qos.sh show                     # 打印策略 JSON + 最近一次加载日志
-./qos.sh list                     # 每条规则一行（带宽按 MiB/GiB 显示）
+./qos.sh show                     # 当前策略 JSON + 各挂载最近一次加载
+./qos.sh list                     # cap + 每条规则一行
 ./qos.sh cap --bandwidth 100M --iops 5000 --meta-iops 2000
 ./qos.sh set /proj-a --bandwidth 20M --meta-iops 50
-./qos.sh set /proj-b --bandwidth 10M --read-bandwidth 8M
 ./qos.sh del /proj-b
-./qos.sh reload                   # 只发 SIGUSR1 并校验 "QoS policy reloaded"
+./qos.sh reload                   # 立即拉取并等待所有挂载确认
 ./qos.sh check                    # 等价于 ./test.sh
 ```
 
-- 限速参数：`--bandwidth/--read-bandwidth/--write-bandwidth`（速率，支持 `B/K/M/G/T/P` 后缀、1024 进制，裸数字为字节/秒）、`--iops/--read-iops/--write-iops`、`--meta-iops`、`--meta-lookup/--meta-getattr/--meta-create/--meta-unlink/--meta-readdir/--meta-statfs`。
-- 编辑采用临时文件 + `os.replace` 原子写入，`version` 自增；只修改本次给出的字段，其余规则保持不变。
-- `mount.sh` 在挂载时会把包内的 `policy.json` 覆盖到 `$BASE/policy.json`；重新格式化/重挂后需要重新执行 `qos.sh set` 或直接编辑 `$BASE/policy.json`。
-- 依赖可用的 `python3`；脚本探测 `/opt/homebrew/bin/python3`、`/usr/local/bin/python3`，也可用 `PY=/path/to/python3` 指定（系统自带的 `/usr/bin/python3` 在 Xcode 损坏的机器上不可用）。
-- **修改立即生效**：`set`/`cap`/`del`/`reload` 都会枚举当前所有 JuiceFS 挂载点、逐个向挂载 daemon 发 `SIGUSR1`，并轮询各挂载日志等待新的 `QoS policy reloaded ... (version=N)` 行；策略重载后 epoch 递增，**已经打开的文件句柄会在下一次读写时自动重解析 scope**（无需重新 open），元数据操作立即按新规则计费。双挂载场景每个挂载点各收到一次信号、各自打一条 reloaded 日志。
-- 批量改完建议追加 `./qos.sh reload` 做一次显式校验；脚本会打印每个挂载点的信号与确认行，任一挂载点未确认则返回非零。
+- 限速参数：`--bandwidth/--read-bandwidth/--write-bandwidth`（支持 `B/K/M/G/T/P` 后缀、1024 进制，裸数字为字节/秒）、`--iops/--read-iops/--write-iops`、`--meta-iops`、`--meta-lookup/--meta-getattr/--meta-create/--meta-unlink/--meta-readdir/--meta-statfs`。
+- 修改后先 PUT（version+1），再对所有挂载发 `SIGUSR1`，轮询日志等待 `QoS policy loaded from ... version=N`；最多 6 秒，失败返回非零。
+- 不依赖本地 `policy.json`；挂载点通过 mount 表枚举（macOS 上 `ps`/`pgrep` 会截断 argv），日志路径用 `lsof` 映射。
 
 ### 3.3 qosd 日志
 
-默认 `--log-level=info` 记录状态变化；`debug` 追加每次请求的明细：
+默认 `--log-level=info` 记录状态变化；`debug` 追加每次请求明细：
 
 | 事件 | 级别 | 示例 |
 | --- | --- | --- |
-| 启动/监听 | info | `juicefs-qosd ... listening on 127.0.0.1:19567 (log-level=info)` |
+| 启动/监听 | info | `juicefs-qosd 1.3.0 listening on 127.0.0.1:19567, redis=127.0.0.1:6379 (log-level=info)` |
 | 鉴权开启 | info | `qosd: bearer token authentication enabled` |
+| 策略写入 | info | `qosd: policy mt-demo stored version=3 tenant=t1 rules=2` |
+| 策略删除 | info | `qosd: policy mt-demo deleted` |
+| 规则新增/更新/删除 | info | `qosd: policy mt-demo rule rule-proj-a added (version=4)` |
 | 新建/更新桶 | info | `qosd: created bucket tenant=t1 ino=20 dim=metaIOPS rate=50 burst=5` |
 | 周期汇总 | info（每 10s） | `qosd: tenants=1 buckets=6 grants=120 denied=3 granted_tokens=...` |
-| 授予令牌 | debug | `qosd: grant tenant=t1 dim=bandwidth want=2097152 granted=2097152 levels=20:20971520,0:104857600` |
+| 授予令牌 | debug | `qosd: grant tenant=t1 dim=bandwidth want=10485760 granted=10485760 levels=20:20971520,0:104857600` |
 | 请求被限流 | debug | `qosd: request throttled ...`（`denied` 计数随心跳汇总） |
-| HTTP 错误 | warn | `qosd: rejected POST /v1/grant from ...: bad token` |
+| 鉴权/请求错误 | warn | `qosd: rejected POST /v1/grant from ...: bad token` |
 | 收到信号/退出 | info | `qosd: received terminated, shutting down` / `qosd: stopped` |
+
+## 4. 测试
+
+`../juicefs-multitenant-qos-test/`（仓库外）提供脚本化验收：
+`qosd.sh`（Redis + qosd + 播种策略）→ `mount.sh` → `test.sh`，以及双挂载的 `mount2.sh` + `shared-test.sh`。
+细节见该目录的 `README.md`。
+
+单元测试：`go test ./pkg/qos/`（策略解析、维度组合、预算校验、本地严格分区、
+租约共享、fail-open、计数服务 HTTP 鉴权、策略文件轮询/远程拉取）。
+
+## 5. 与 P1 的边界
+
+以下内容不在本阶段，属于控制面（05 文档的 P1）：
+
+- 预算准入 API（`ValidateBudget` 已提供函数，未接 HTTP）、审批流。
+- 租户/目录用量上报与审计、额度借用（P2）。
+- 策略快照签名/防篡改（当前依赖 `qosd` 的 token 与网络隔离）。
+- 元数据分类之外的更多 op 类别、每个 inode 的例外规则。
+- 真实元数据引擎上的多客户端一致性验证（本阶段用 sqlite3 单机两挂载验证共享预算）。
 
 ## 4. 测试
 

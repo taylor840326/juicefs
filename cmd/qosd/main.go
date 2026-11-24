@@ -14,15 +14,17 @@
  * limitations under the License.
  */
 
-// Command qosd is the standalone QoS counter service.
+// Command qosd is the standalone multi-tenant QoS control service.
 //
-// It is the same service as `juicefs qosd`, but built as its own small
-// executable: it only depends on the token-bucket counter, so it can be
-// deployed as a sidecar or a shared service next to the mounts without
-// pulling in FUSE, the metadata engines or any object storage client.
+// It stores the policy of every tenant volume in Redis (create, read, update
+// and delete through the HTTP API), serves the policy snapshots to the mounts,
+// and keeps the shared token buckets used to enforce the tenant budget across
+// all of them. It only depends on pkg/qos, so it can be deployed next to the
+// mounts without pulling in FUSE, the metadata engines or object storage.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
@@ -59,7 +61,8 @@ func setLogLevel(level string) error {
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:19567", "address to listen on")
-	token := flag.String("token", "", "bearer token required by mounts (can also be set with JFS_QOSD_TOKEN)")
+	redisAddr := flag.String("redis", "", "Redis address of the policy store, e.g. redis://127.0.0.1:6379/0 or 127.0.0.1:6379")
+	token := flag.String("token", "", "bearer token required by clients (can also be set with JFS_QOSD_TOKEN)")
 	logLevel := flag.String("log-level", "info", "log level: info, warn, debug")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -75,13 +78,26 @@ func main() {
 	if *token == "" {
 		*token = os.Getenv("JFS_QOSD_TOKEN")
 	}
+	if *redisAddr == "" {
+		*redisAddr = os.Getenv("JFS_QOSD_REDIS")
+	}
+	if *redisAddr == "" {
+		fmt.Fprintf(os.Stderr, "ERROR: --redis is required (or set JFS_QOSD_REDIS); qosd stores policies in Redis\n")
+		os.Exit(2)
+	}
+
+	store, err := qos.NewRedisStore(*redisAddr)
+	if err != nil {
+		logger.Fatalf("redis: %s", err)
+	}
+	defer store.Close()
 
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		logger.Fatalf("listen on %s: %s", *listen, err)
 	}
 	if *token == "" {
-		logger.Warnf("QoS counter service is running without a token; restrict the listen address to a trusted network")
+		logger.Warnf("qosd is running without a token; restrict the listen address to a trusted network")
 	} else {
 		logger.Infof("qosd: bearer token authentication enabled")
 	}
@@ -89,19 +105,23 @@ func main() {
 	counter := qos.NewCounter()
 	go heartbeat(counter, 10*time.Second)
 
+	server := qos.NewServer(store, counter, *token)
 	srv := &http.Server{
-		Handler:           counter.Handler(*token),
+		Handler:           server,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	logger.Infof("juicefs-qosd %s listening on %s (log-level=%s)", version.Version(), *listen, *logLevel)
+	logger.Infof("juicefs-qosd %s listening on %s, redis=%s (log-level=%s)",
+		version.Version(), *listen, *redisAddr, *logLevel)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		s := <-sig
 		logger.Infof("qosd: received %s, shutting down", s)
-		_ = srv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
 	}()
 
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {

@@ -362,6 +362,14 @@ func qosFlags() []cli.Flag {
 			Value: true,
 			Usage: "let I/O through when the QoS counter service is unavailable (default: true)",
 		},
+		&cli.StringFlag{
+			Name:  "qos-server",
+			Usage: "URL of the QoS control service (qosd); the mount polls /v1/policies/{volume} every 3s for its policy (default: empty)",
+		},
+		&cli.StringFlag{
+			Name:  "qos-server-token",
+			Usage: "bearer token for the QoS control service (can also be set with JFS_QOS_SERVER_TOKEN)",
+		},
 	})
 }
 
