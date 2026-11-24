@@ -259,3 +259,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o juicefs-qosd-linux-amd64 ./cmd
 元数据操作都被当成已取消，直接返回 EINTR。改为优先使用 `Canceled()`（普通
 `context.Context` 回退到 `Err()`），并去掉对 `ctx.Done()` 的 select（FUSE 上下文
 未实现该通道）。修复提交：`597f8ec`。
+
+## 相关文档
+
+- [07-qosd-api.md](07-qosd-api.md)：qosd HTTP 接口、curl 示例、Redis 键布局；
+- [08-qosctl.md](08-qosctl.md)：`qosctl` 命令行（`show/list/cap/set/del/reload`），与 `qos.sh` 功能对齐。

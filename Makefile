@@ -52,6 +52,9 @@ juicefs.all: Makefile cmd/*.go pkg/*/*.go
 juicefs-qosd: Makefile cmd/qosd/main.go pkg/qos/*.go go.*
 	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o juicefs-qosd ./cmd/qosd
 
+juicefs-qosctl: Makefile cmd/qosctl/main.go pkg/qos/*.go go.*
+	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o juicefs-qosctl ./cmd/qosctl
+
 # This is the script for compiling the Linux version on the MacOS platform.
 # Please execute the `brew install FiloSottile/musl-cross/musl-cross` command before using it.
 juicefs.linux:

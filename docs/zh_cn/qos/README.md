@@ -12,6 +12,8 @@
 | [04-evolution-analysis.md](04-evolution-analysis.md) | 多租户演进：角色与预算、目录级策略、严格分区、层级令牌桶与集中计数 |
 | [05-multitenant-implementation.md](05-multitenant-implementation.md) | 多租户需求落盘与实现方案：功能/非功能需求与验收标准、scope 解析、租约与计数服务、控制面 API、代码改造清单、里程碑与待决问题 |
 | [06-multitenant-client-implementation.md](06-multitenant-client-implementation.md) | P0 客户端落地：策略解析与 scope 缓存、层级桶、qosd 多租户策略服务（Redis + CRUD API）、门控清单、CLI 与测试 |
+| [07-qosd-api.md](07-qosd-api.md) | qosd HTTP 接口说明：数据模型、认证、策略/规则/租约接口、curl 示例、错误码、Redis 键布局 |
+| [08-qosctl.md](08-qosctl.md) | qosctl 命令行：构建、全局参数、cap/set/del/reload、与 qos.sh 的对应关系 |
 
 ## 多租户能力（P0）
 
