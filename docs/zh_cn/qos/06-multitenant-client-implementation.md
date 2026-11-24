@@ -87,6 +87,38 @@ juicefs mount sqlite3:///data/meta.db /mnt/jfs \
 - 旧的客户端级参数（`--qos-bandwidth` 等）继续可用，与策略叠加；两者都未配置
   时没有任何额外开销。
 
+### 3.1 独立 qosd 可执行程序
+
+计数服务同时提供独立二进制，适合和挂载进程分开部署（sidecar 或平台共享服务）。
+它只依赖令牌桶计数器，不编译 FUSE、元数据引擎和对象存储客户端，体积约 7MB：
+
+```bash
+# 单独编译（不依赖 juicefs 主二进制）
+make juicefs-qosd
+# 等价于：CGO_ENABLED=0 go build -ldflags="-s -w" -o juicefs-qosd ./cmd/qosd
+
+# 交叉编译 Linux 静态版本
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o juicefs-qosd-linux-amd64 ./cmd/qosd
+```
+
+参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--listen` | `127.0.0.1:19567` | 监听地址；跨主机部署时用 `0.0.0.0:19567` 并配合 token 与网络隔离 |
+| `--token` | env `JFS_QOSD_TOKEN` | 校验 `Authorization: Bearer` / `X-JuiceFS-Token`；为空则跳过鉴权并打警告 |
+| `--log-level` | `info` | 日志级别，可选 `info`、`warn`、`debug`；非法值直接报错退出 |
+| `--version` | — | 打印版本后退出 |
+
+```bash
+juicefs-qosd --listen 0.0.0.0:19567 --token "$JFS_QOSD_TOKEN" --log-level debug
+juicefs-qosd --log-level bogus
+# ERROR: invalid log level "bogus": must be one of info, warn, debug
+```
+
+`juicefs qosd` 子命令仍然保留，行为一致（日志级别用全局 `juicefs --log-level`）。
+测试脚本会自动优先使用 `juicefs-qosd`，找不到时回退到 `juicefs qosd`。
+
 ## 4. 测试
 
 `../juicefs-multitenant-qos-test/`（仓库外）提供脚本化验收：

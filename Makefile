@@ -49,6 +49,9 @@ juicefs.gluster.cover: Makefile cmd/*.go pkg/*/*.go
 juicefs.all: Makefile cmd/*.go pkg/*/*.go
 	go build -tags ceph,fdb,gluster -ldflags="$(LDFLAGS)"  -o juicefs.all .
 
+juicefs-qosd: Makefile cmd/qosd/main.go pkg/qos/*.go go.*
+	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o juicefs-qosd ./cmd/qosd
+
 # This is the script for compiling the Linux version on the MacOS platform.
 # Please execute the `brew install FiloSottile/musl-cross/musl-cross` command before using it.
 juicefs.linux:
