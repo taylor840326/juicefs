@@ -138,6 +138,8 @@ juicefs-qosd --log-level bogus
 - 编辑采用临时文件 + `os.replace` 原子写入，`version` 自增；只修改本次给出的字段，其余规则保持不变。
 - `mount.sh` 在挂载时会把包内的 `policy.json` 覆盖到 `$BASE/policy.json`；重新格式化/重挂后需要重新执行 `qos.sh set` 或直接编辑 `$BASE/policy.json`。
 - 依赖可用的 `python3`；脚本探测 `/opt/homebrew/bin/python3`、`/usr/local/bin/python3`，也可用 `PY=/path/to/python3` 指定（系统自带的 `/usr/bin/python3` 在 Xcode 损坏的机器上不可用）。
+- **修改立即生效**：`set`/`cap`/`del`/`reload` 都会枚举当前所有 JuiceFS 挂载点、逐个向挂载 daemon 发 `SIGUSR1`，并轮询各挂载日志等待新的 `QoS policy reloaded ... (version=N)` 行；策略重载后 epoch 递增，**已经打开的文件句柄会在下一次读写时自动重解析 scope**（无需重新 open），元数据操作立即按新规则计费。双挂载场景每个挂载点各收到一次信号、各自打一条 reloaded 日志。
+- 批量改完建议追加 `./qos.sh reload` 做一次显式校验；脚本会打印每个挂载点的信号与确认行，任一挂载点未确认则返回非零。
 
 ### 3.3 qosd 日志
 
@@ -188,6 +190,7 @@ juicefs-qosd --log-level bogus
 | `/proj-a-renamed` 200 次 `stat`（metaIOPS 50） | 4.14 s ≈ 50 次/s |
 | `qosd` 停机时 fail-open 写 256 MiB | 2.03 s，日志含 lease 失败告警 |
 | 两个挂载并行各写 100 MiB 到 `/proj-b`（共享预算） | 19.92 s ≈ 10.0 MiB/s（合计） |
+| 400 MiB 写进行中 `qos.sh set /proj-a --bandwidth 100M`（已打开句柄热更新） | 5.80 s（前 2 s 走 20 MiB/s，其余走 100 MiB/s；不热更新约需 20 s） |
 
 排障记录：policy 模式最初挂载点报 EIO。根因是 **FUSE 请求上下文的 `Err()` 恒为
 `syscall.EINTR`**（`pkg/fuse/context.go` 的设计：取消要通过 `Canceled()` 判断，

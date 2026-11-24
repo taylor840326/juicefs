@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,8 +50,10 @@ type handle struct {
 	ops        []Context
 
 	// scope pins the QoS rule chain of this file, so a read or write does
-	// not walk the directory tree again.
-	scope *qos.Scope
+	// not walk the directory tree again. It is refreshed on the next I/O
+	// when the policy epoch changes, so a reload also affects open files.
+	scope      atomic.Pointer[qos.Scope]
+	scopeEpoch atomic.Uint64
 
 	// rwlock
 	writing uint32
@@ -244,7 +247,10 @@ func (v *VFS) newFileHandle(inode Ino, length uint64, flags uint32, scope *qos.S
 	h.Lock()
 	defer h.Unlock()
 	h.flags = flags
-	h.scope = scope
+	if scope != nil {
+		h.scope.Store(scope)
+	}
+	h.scopeEpoch.Store(v.qosEpoch.Load())
 	switch flags & O_ACCMODE {
 	case syscall.O_RDONLY:
 		h.reader = v.reader.Open(inode, length)

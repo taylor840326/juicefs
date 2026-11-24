@@ -159,18 +159,37 @@ func (v *VFS) qosWaitMeta(ctx Context, ino meta.Ino, class string) syscall.Errno
 	return v.waitMeta(ctx)
 }
 
+// scopeForHandle returns the scope pinned by the handle. After a policy
+// reload the epoch changes and the chain is resolved again on the next I/O,
+// so limits also reach files that are already open.
+func (v *VFS) scopeForHandle(ctx Context, h *handle) *qos.Scope {
+	if h == nil || v.qosMgr == nil {
+		return nil
+	}
+	s := h.scope.Load()
+	epoch := v.qosEpoch.Load()
+	if e := h.scopeEpoch.Load(); e != epoch {
+		if ns := v.qosScope(ctx, h.inode); ns != nil {
+			h.scope.Store(ns)
+		} else {
+			h.scope.Store(nil)
+		}
+		h.scopeEpoch.Store(epoch)
+		s = h.scope.Load()
+	}
+	return s
+}
+
 // qosWaitData charges n bytes of a data operation. The scope was bound to the
 // handle when the file was opened, so charging does not walk the tree for
-// every read or write.
+// every read or write unless the policy changed in the meantime.
 func (v *VFS) qosWaitData(ctx Context, h *handle, read bool, n int64) syscall.Errno {
 	if n <= 0 {
 		return 0
 	}
-	if v.qosMgr != nil && h != nil {
-		if s := h.scope; s != nil {
-			if err := v.qosMgr.Charge(ctx, s, qos.Op{Read: read, Bytes: n}); err != nil {
-				return errnoOf(err)
-			}
+	if s := v.scopeForHandle(ctx, h); s != nil {
+		if err := v.qosMgr.Charge(ctx, s, qos.Op{Read: read, Bytes: n}); err != nil {
+			return errnoOf(err)
 		}
 	}
 	return v.waitData(ctx, read, n)
@@ -205,8 +224,8 @@ func errnoOf(err error) syscall.Errno {
 // handle. It keeps the legacy --qos-* behavior (one operation, no bytes) so
 // both configurations stay coherent.
 func (v *VFS) qosWaitCopy(ctx Context, h *handle, n int64) syscall.Errno {
-	if v.qosMgr != nil && h != nil && n > 0 {
-		if s := h.scope; s != nil {
+	if n > 0 {
+		if s := v.scopeForHandle(ctx, h); s != nil {
 			if err := v.qosMgr.Charge(ctx, s, qos.Op{Bytes: n}); err != nil {
 				return errnoOf(err)
 			}
