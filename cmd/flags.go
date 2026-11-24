@@ -315,12 +315,46 @@ func metaFlags() []cli.Flag {
 	})
 }
 
+func qosFlags() []cli.Flag {
+	return addCategories("QOS", []cli.Flag{
+		&cli.StringFlag{
+			Name:  "qos-bandwidth",
+			Usage: "total bandwidth limit for reading and writing, e.g. 100M, 1G (default: unlimited)",
+		},
+		&cli.StringFlag{
+			Name:  "qos-read-bandwidth",
+			Usage: "bandwidth limit for reading, overrides qos-bandwidth in the read direction (default: unlimited)",
+		},
+		&cli.StringFlag{
+			Name:  "qos-write-bandwidth",
+			Usage: "bandwidth limit for writing, overrides qos-bandwidth in the write direction (default: unlimited)",
+		},
+		&cli.Int64Flag{
+			Name:  "qos-iops",
+			Usage: "maximum number of data operations (read/write/copy) per second (default: unlimited)",
+		},
+		&cli.Int64Flag{
+			Name:  "qos-meta-iops",
+			Usage: "maximum number of metadata operations per second (default: unlimited)",
+		},
+		&cli.StringFlag{
+			Name:  "qos-config",
+			Usage: "path of a JSON file with QoS limits; applied at mount time and reloaded on SIGUSR1 (default: \"\")",
+		},
+		&cli.StringFlag{
+			Name:  "qos-http-token",
+			Usage: "token required by the QoS HTTP API served on the metrics address; empty disables the API (can also be set with JFS_QOS_HTTP_TOKEN)",
+		},
+	})
+}
+
 func clientFlags(defaultEntryCache float64) []cli.Flag {
 	return expandFlags(
 		metaFlags(),
 		metaCacheFlags(defaultEntryCache),
 		storageFlags(),
 		dataCacheFlags(),
+		qosFlags(),
 	)
 }
 

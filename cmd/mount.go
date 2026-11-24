@@ -29,6 +29,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
@@ -40,6 +42,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/metric"
+	"github.com/juicedata/juicefs/pkg/qos"
 	"github.com/juicedata/juicefs/pkg/usage"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
@@ -291,11 +294,47 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		cfg.UMask = uint16(umask)
 	}
 
+	if qosConf := getQoSConf(c); qosConf != nil {
+		cfg.QoS = qosConf
+	}
+
 	skip_check := os.Getenv("SKIP_BACKUP_META_CHECK") == "true"
 	if !skip_check && cfg.BackupMeta > 0 && cfg.BackupMeta < time.Minute*5 {
 		logger.Fatalf("backup-meta should not be less than 5 minutes: %s", cfg.BackupMeta)
 	}
 	return cfg
+}
+
+// getQoSConf builds the client QoS configuration from command line flags and,
+// when set, from the JSON file passed to --qos-config. It returns nil when no
+// limit is configured, so that the unmetered path stays allocation-free.
+func getQoSConf(c *cli.Context) *qos.Config {
+	conf := &qos.Config{
+		Bandwidth:      utils.ParseBytes(c, "qos-bandwidth", 'M'),
+		ReadBandwidth:  utils.ParseBytes(c, "qos-read-bandwidth", 'M'),
+		WriteBandwidth: utils.ParseBytes(c, "qos-write-bandwidth", 'M'),
+	}
+	if v := c.Int64("qos-iops"); v > 0 {
+		conf.IOPS = uint64(v)
+	} else if v < 0 {
+		logger.Warnf("qos-iops should be positive, ignored: %d", v)
+	}
+	if v := c.Int64("qos-meta-iops"); v > 0 {
+		conf.MetaIOPS = uint64(v)
+	} else if v < 0 {
+		logger.Warnf("qos-meta-iops should be positive, ignored: %d", v)
+	}
+	if path := c.String("qos-config"); path != "" {
+		if u, err := loadQoSFile(path); err != nil {
+			logger.Warnf("load QoS config %s: %s", path, err)
+		} else if u != nil {
+			*conf = conf.Apply(*u)
+		}
+	}
+	if !conf.Enabled() {
+		return nil
+	}
+	return conf
 }
 
 func registerMetaMsg(m meta.Meta, store chunk.ChunkStore, chunkConf *chunk.Config) {
@@ -513,8 +552,21 @@ func getDefaultLogDir() string {
 	return defaultLogDir
 }
 
+// qosConfigFile is the value of --qos-config of the current mount process. It
+// is kept so that the SIGUSR1 handler can reload the limits at runtime.
+var qosConfigFile string
+
+// The QoS HTTP API is served on the metrics address. It is only registered by
+// the mount process, the only client that owns a VFS; gateway/webdav/mdtest
+// run on pkg/fs and therefore have no runtime limits to expose.
+var (
+	qosHTTPBackend atomic.Pointer[vfs.VFS]
+	qosHTTPOnce    sync.Once
+)
+
 func mount(c *cli.Context) error {
 	setup(c, 2)
+	qosConfigFile = c.String("qos-config")
 	addr := c.Args().Get(0)
 	removePassword(addr)
 	mp := c.Args().Get(1)
@@ -654,6 +706,22 @@ func mount(c *cli.Context) error {
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	qosHTTPBackend.Store(v)
+	qosHTTPOnce.Do(func() {
+		token := c.String("qos-http-token")
+		if token == "" {
+			token = os.Getenv("JFS_QOS_HTTP_TOKEN")
+		}
+		http.Handle("/api/qos", qos.HTTPHandler(func() qos.Updater {
+			if v := qosHTTPBackend.Load(); v != nil {
+				return v
+			}
+			return nil
+		}, token))
+		if token != "" {
+			logger.Infof("QoS HTTP API enabled at /api/qos (metrics address), token required")
+		}
+	})
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)

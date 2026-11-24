@@ -57,6 +57,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// QoS is a message to inspect or update the client-side QoS limits at runtime.
+	QoS = 1009
 )
 
 const (

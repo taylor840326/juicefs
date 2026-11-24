@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/qos"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	io_prometheus_client "github.com/prometheus/client_model/go"
@@ -538,6 +539,29 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 
 		writeProgress(&totalChunks, &currChunks, out, done)
 		_, _ = out.Write([]byte{uint8(eno)})
+
+	case meta.QoS:
+		var update qos.Update
+		var conf qos.Config
+		var st syscall.Errno
+		if err := json.Unmarshal(r.Buffer(), &update); err != nil {
+			logger.Warnf("invalid QoS update: %s", err)
+			st = syscall.EINVAL
+		} else {
+			conf = v.UpdateQoS(update)
+		}
+		data, err := json.Marshal(conf)
+		if err != nil {
+			logger.Errorf("marshal QoS response: %v", err)
+			data = nil
+			st = syscall.EIO
+		}
+		w := utils.NewBuffer(uint32(1 + 4 + len(data) + 1))
+		w.Put8(meta.CDATA)
+		w.Put32(uint32(len(data)))
+		w.Put(data)
+		w.Put8(uint8(st))
+		_, _ = out.Write(w.Bytes())
 
 	case meta.FillCache:
 		paths := strings.Split(string(r.Get(int(r.Get32()))), "\n")

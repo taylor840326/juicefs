@@ -33,6 +33,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/qos"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -1159,4 +1160,34 @@ func testReaddir(t *testing.T, metaUri string, dirNum int, offset int) {
 	entriesOne := readAll(ctx, parent, fh, offset)
 	entriesTwo := readAll(ctx, parent, fh, offset)
 	require.True(t, reflect.DeepEqual(entriesOne, entriesTwo))
+}
+
+func TestVFSQoSUpdate(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	if cur := v.GetQoS(); cur.Enabled() {
+		t.Fatalf("test VFS should start without QoS limits")
+	}
+	bw := uint64(1 << 20)
+	conf := v.UpdateQoS(qos.Update{Bandwidth: &bw})
+	if conf.Bandwidth != bw {
+		t.Fatalf("unexpected bandwidth: %d", conf.Bandwidth)
+	}
+	if got := v.GetQoS(); got.Bandwidth != bw {
+		t.Fatalf("GetQoS did not observe the update: %+v", got)
+	}
+	// A partial update keeps the other limits.
+	iops := uint64(100)
+	conf = v.UpdateQoS(qos.Update{IOPS: &iops})
+	if conf.Bandwidth != bw || conf.IOPS != iops {
+		t.Fatalf("unexpected merged config: %+v", conf)
+	}
+	// Zero clears the limit; with everything cleared the controller is gone.
+	zero := uint64(0)
+	conf = v.UpdateQoS(qos.Update{Bandwidth: &zero, IOPS: &zero})
+	if conf.Enabled() {
+		t.Fatalf("limits should be cleared: %+v", conf)
+	}
+	if ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3})); v.waitMeta(ctx) != 0 {
+		t.Fatalf("unlimited VFS should not wait")
+	}
 }

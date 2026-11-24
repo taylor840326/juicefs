@@ -66,6 +66,59 @@
 |`--cache-expire=0` <VersionAdd>1.2</VersionAdd>|超过设置的时间未被访问的缓存块将会被自动清除（即使 `--cache-eviction` 的值为 `none`，这些缓存块也会被删除），单位为秒，值为 0 表示永不过期（默认值：0）|
 |`--max-readahead` <VersionAdd>1.3</VersionAdd>|最大预读缓冲区大小，单位为 MiB |
 
+#### 客户端 QoS 参数 {#mount-qos-options}
+
+客户端 QoS 限制作用于单个挂载进程的请求入口，目前仅覆盖 `mount` 模式（FUSE 挂载）；`gateway`、`webdav`、`mdtest` 等模式使用 `pkg/fs` 实现，不经过 VFS，暂时不受这些参数限制。多个进程（或多个 Pod）共享同一个挂载进程时，它们共享同一份额度；未设置任何 QoS 参数时完全不做限制，也没有额外开销。
+
+|项 | 说明|
+|-|-|
+|`--qos-bandwidth=0` <VersionAdd>1.4</VersionAdd>|客户端总带宽限制（读写合计），支持 `B`、`K`、`M`、`G` 等单位，例如 `100M`、`1G`，默认 0 表示不限制。|
+|`--qos-read-bandwidth=0` <VersionAdd>1.4</VersionAdd>|读方向带宽限制；设置后读请求不再占用 `--qos-bandwidth` 的额度，默认 0 表示不限制。|
+|`--qos-write-bandwidth=0` <VersionAdd>1.4</VersionAdd>|写方向带宽限制；设置后写请求不再占用 `--qos-bandwidth` 的额度，默认 0 表示不限制。|
+|`--qos-iops=0` <VersionAdd>1.4</VersionAdd>|数据操作（read、write、copy_file_range）每秒次数上限，默认 0 表示不限制。|
+|`--qos-meta-iops=0` <VersionAdd>1.4</VersionAdd>|元数据操作（lookup、getattr、create、unlink、readdir、statfs 等）每秒次数上限，默认 0 表示不限制。|
+|`--qos-config` <VersionAdd>1.4</VersionAdd>|QoS 配置文件路径（JSON）。挂载时读取一次，之后每次收到 `SIGUSR1` 信号都会重新读取并生效，默认空表示不使用配置文件。|
+|`--qos-http-token` <VersionAdd>1.4</VersionAdd>|QoS HTTP API 的访问令牌。设置后，监控地址上的 `/api/qos` 可用该令牌查询或修改限制；为空时该接口返回 403。也可以通过环境变量 `JFS_QOS_HTTP_TOKEN` 设置，默认空表示不启用。|
+
+当 `--qos-bandwidth` 与 `--qos-read-bandwidth`/`--qos-write-bandwidth` 同时设置时，对应方向只按方向额度计费；例如只设置 `--qos-read-bandwidth=500M` 时，读请求受 500 MiB/s 限制，写请求不受限制。带宽限制按经过 FUSE 的数据量计算，命中内核页缓存的读不会计入；观测实际吞吐请以 `juicefs stats` 或监控指标中的读写速率为准。
+
+QoS 限制支持在挂载后动态调整，无需卸载或重启挂载进程：
+
+- `juicefs qos <挂载点>`：查看当前生效的限制；带上选项则修改对应限制，未指定的项保持原值，取值 `0` 表示取消该项限制。
+  ```shell
+  # 查看当前限制
+  juicefs qos /mnt/jfs
+
+  # 总带宽 100 MiB/s，元数据操作 1000 次/秒
+  juicefs qos /mnt/jfs --bandwidth 100M --meta-iops 1000
+
+  # 读、写分别限制
+  juicefs qos /mnt/jfs --read-bandwidth 200M --write-bandwidth 50M
+
+  # 取消总带宽与数据 IOPS 限制（其余保持不变）
+  juicefs qos /mnt/jfs --bandwidth 0 --iops 0
+  ```
+- 通过 `--qos-config` 指定的文件，配合 `kill -USR1 <juicefs pid>` 重载。文件内容为 JSON，带宽字段支持 `100M`、`1G` 等写法或直接写字节数/秒，未出现的字段保持原值：
+  ```json
+  {
+    "bandwidth": "100M",
+    "metaIOPS": 1000
+  }
+  ```
+  在 Kubernetes 中可以把该文件放在 ConfigMap 里通过 volume 挂载，更新 ConfigMap 后对挂载进程发送 `SIGUSR1` 即可生效。
+- 监控地址（`--metrics`）上提供带令牌鉴权的 HTTP 接口 `/api/qos`，请求体与 QoS 配置文件相同，未出现的字段保持原值。令牌由 `--qos-http-token` 或环境变量 `JFS_QOS_HTTP_TOKEN` 设置，两者都为空时接口返回 403；令牌为空时请勿把监控地址暴露到非可信网络。
+  ```shell
+  # 查询当前限制
+  curl -s -H "Authorization: Bearer $JFS_QOS_HTTP_TOKEN" http://127.0.0.1:9567/api/qos
+
+  # 修改限制
+  curl -s -X PUT -H "Authorization: Bearer $JFS_QOS_HTTP_TOKEN" \
+    -d '{"bandwidth":"100M","metaIOPS":1000}' http://127.0.0.1:9567/api/qos
+  ```
+  该接口只由 `mount` 模式注册；`--metrics` 默认监听 `127.0.0.1`，如果改为监听 `0.0.0.0`，请设置足够强的令牌，并通过网络策略或反向代理限制访问来源。
+
+`juicefs qos` 与 `--qos-config` 都只调整对应挂载进程自身的限制；共享同一个挂载进程的多个 Pod 共用这一份额度。
+
 #### 监控相关参数 {#mount-metrics-options}
 
 |项 | 说明|

@@ -66,6 +66,59 @@ For metadata cache description and usage, refer to [Kernel metadata cache](../gu
 |`--cache-expire=0` <VersionAdd>1.2</VersionAdd>|Cache blocks that have not been accessed for more than the set time, in seconds, will be automatically cleared (even if the value of `--cache-eviction` is `none`, these cache blocks will be deleted). A value of 0 means never expires (default: 0)|
 |`--max-readahead` <VersionAdd>1.3</VersionAdd>|max buffering for read ahead in MiB|
 
+#### Client QoS related options {#mount-qos-options}
+
+Client QoS limits are enforced at the request entry of a single mount process and currently apply to `mount` (FUSE mount) only; `gateway`, `webdav` and `mdtest` run on `pkg/fs` instead of VFS, so these limits do not cover them yet. When multiple processes (or Pods) share one mount process, they share the same quota. Without any QoS option, no limit is enforced and there is no extra overhead.
+
+|Items|Description|
+|-|-|
+|`--qos-bandwidth=0` <VersionAdd>1.4</VersionAdd>|total bandwidth limit (read + write), supports units like `B`, `K`, `M`, `G`, e.g. `100M`, `1G` (default: 0, unlimited)|
+|`--qos-read-bandwidth=0` <VersionAdd>1.4</VersionAdd>|bandwidth limit for reads; when set, reads no longer consume the `--qos-bandwidth` quota (default: 0, unlimited)|
+|`--qos-write-bandwidth=0` <VersionAdd>1.4</VersionAdd>|bandwidth limit for writes; when set, writes no longer consume the `--qos-bandwidth` quota (default: 0, unlimited)|
+|`--qos-iops=0` <VersionAdd>1.4</VersionAdd>|max number of data operations (read, write, copy_file_range) per second (default: 0, unlimited)|
+|`--qos-meta-iops=0` <VersionAdd>1.4</VersionAdd>|max number of metadata operations (lookup, getattr, create, unlink, readdir, statfs, ...) per second (default: 0, unlimited)|
+|`--qos-config` <VersionAdd>1.4</VersionAdd>|path of a JSON file with QoS limits; it is read at mount time and reloaded on every `SIGUSR1` signal (default: "", disabled)|
+|`--qos-http-token` <VersionAdd>1.4</VersionAdd>|token required by the QoS HTTP API served on the metrics address; when empty the `/api/qos` endpoint answers 403. It can also be set with the `JFS_QOS_HTTP_TOKEN` environment variable (default: "", disabled)|
+
+When `--qos-bandwidth` is used together with `--qos-read-bandwidth` or `--qos-write-bandwidth`, that direction is charged against its own quota only; for example with only `--qos-read-bandwidth=500M`, reads are limited to 500 MiB/s while writes stay unlimited. The bandwidth limit counts data delivered through FUSE, so reads served by the kernel page cache are not counted; use `juicefs stats` or metrics to observe the actual throughput.
+
+The limits can be changed after mounting, without unmounting or restarting the client:
+
+- `juicefs qos <mountpoint>` shows the effective limits; options change the matching limits, omitted ones keep their value, and `0` clears a limit.
+  ```shell
+  # Show the current limits
+  juicefs qos /mnt/jfs
+
+  # 100 MiB/s in total and 1000 metadata operations per second
+  juicefs qos /mnt/jfs --bandwidth 100M --meta-iops 1000
+
+  # Limit reads and writes separately
+  juicefs qos /mnt/jfs --read-bandwidth 200M --write-bandwidth 50M
+
+  # Clear the total bandwidth and data IOPS limits (other limits stay)
+  juicefs qos /mnt/jfs --bandwidth 0 --iops 0
+  ```
+- A file passed to `--qos-config` can be reloaded with `kill -USR1 <juicefs pid>`. The file is JSON; bandwidth fields accept values like `100M` or `1G`, or a raw number of bytes per second, and omitted fields keep their value:
+  ```json
+  {
+    "bandwidth": "100M",
+    "metaIOPS": 1000
+  }
+  ```
+  In Kubernetes, put the file in a ConfigMap mounted as a volume and send `SIGUSR1` to the mount process after updating it.
+- An HTTP endpoint `/api/qos` with token authentication is served on the metrics address (`--metrics`); the request body has the same shape as the QoS config file, and omitted fields keep their value. The token comes from `--qos-http-token` or `JFS_QOS_HTTP_TOKEN`; when both are empty the endpoint answers 403, so do not expose the metrics address to untrusted networks without a token.
+  ```shell
+  # Show the current limits
+  curl -s -H "Authorization: Bearer $JFS_QOS_HTTP_TOKEN" http://127.0.0.1:9567/api/qos
+
+  # Change the limits
+  curl -s -X PUT -H "Authorization: Bearer $JFS_QOS_HTTP_TOKEN" \
+    -d '{"bandwidth":"100M","metaIOPS":1000}' http://127.0.0.1:9567/api/qos
+  ```
+  The endpoint is only registered by `mount` processes. `--metrics` listens on `127.0.0.1` by default; if it is changed to `0.0.0.0`, use a strong token and restrict the source with network policies or a reverse proxy.
+
+Both `juicefs qos` and `--qos-config` only change the limits of the mount process they target; multiple Pods sharing one mount process share the same quota.
+
 #### Metrics related options {#mount-metrics-options}
 
 ||Items|Description|
