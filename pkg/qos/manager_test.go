@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -195,17 +196,64 @@ func TestCanceledCharge(t *testing.T) {
 func TestCounterGrant(t *testing.T) {
 	c := NewCounter()
 	levels := []LeaseLevel{{Ino: 100, Rate: 1000}, {Ino: 0, Rate: 1000}}
-	if got := c.Grant("t1", levels, DimBandwidth, 80); got != 80 {
+	// The bucket capacity is one lease quantum (rate/2 = 500).
+	if got := c.Grant("t1", levels, DimBandwidth, 480); got != 480 {
 		t.Fatalf("first grant: %d", got)
 	}
-	// both levels were deducted; the parent and the child each have 20 left
-	// (plus a few refilled tokens).
-	got := c.Grant("t1", levels, DimBandwidth, 80)
-	if got < 18 || got > 25 {
+	// Both levels were deducted; 20 tokens are left (plus a negligible refill).
+	got := c.Grant("t1", levels, DimBandwidth, 480)
+	if got < 18 || got > 30 {
 		t.Fatalf("second grant: %d", got)
 	}
-	if got := c.Grant("t2", levels, DimBandwidth, 80); got != 80 {
+	if got := c.Grant("t2", levels, DimBandwidth, 480); got != 480 {
 		t.Fatalf("another tenant must have its own buckets: %d", got)
+	}
+}
+
+type countingLease struct {
+	mu      sync.Mutex
+	calls   int
+	latency time.Duration
+	perCall int64
+}
+
+func (c *countingLease) Grant(ctx context.Context, tenant string, levels []LeaseLevel, dim string, want int64) (int64, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	time.Sleep(c.latency)
+	if want > c.perCall {
+		want = c.perCall
+	}
+	return want, nil
+}
+
+func (c *countingLease) Calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestLeaseRequestCoalescing makes sure a burst of blocked operations does not
+// turn into one HTTP request per operation.
+func TestLeaseRequestCoalescing(t *testing.T) {
+	lease := &countingLease{latency: 5 * time.Millisecond, perCall: 10}
+	m := NewManager("t1", lease, false)
+	scope := &Scope{Chain: []Level{{Ino: 100, Limits: Limits{Bandwidth: 40}}}}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := m.Charge(context.Background(), scope, Op{Bytes: 1}); err != nil {
+				t.Errorf("charge: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if calls := lease.Calls(); calls >= 20 {
+		t.Fatalf("40 charges caused %d lease requests; coalescing/pacing is not working", calls)
 	}
 }
 

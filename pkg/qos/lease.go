@@ -152,7 +152,7 @@ func counterKey(tenant string, ino uint64, dim string) string {
 
 func (c *Counter) bucketLocked(tenant string, l LeaseLevel, dim string) *tokenBucket {
 	key := counterKey(tenant, l.Ino, dim)
-	burst := burstFor(l.Rate)
+	burst := leaseQuantum(l.Rate, dim)
 	b := c.buckets[key]
 	if b == nil {
 		b = newTokenBucket(l.Rate, burst, true)
