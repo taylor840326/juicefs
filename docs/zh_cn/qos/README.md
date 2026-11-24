@@ -10,6 +10,7 @@
 | [02-requirements-analysis.md](02-requirements-analysis.md) | 现有机制分析、限流位置选型、动态控制通道选型、风险与约束 |
 | [03-implementation.md](03-implementation.md) | 架构、模块与代码位置、数据路径计费规则、CLI/HTTP 协议、测试与限制 |
 | [04-evolution-analysis.md](04-evolution-analysis.md) | 多租户演进：角色与预算、目录级策略、严格分区、层级令牌桶与集中计数 |
+| [05-multitenant-implementation.md](05-multitenant-implementation.md) | 多租户需求落盘与实现方案：功能/非功能需求与验收标准、scope 解析、租约与计数服务、控制面 API、代码改造清单、里程碑与待决问题 |
 
 ## 能力概览
 
