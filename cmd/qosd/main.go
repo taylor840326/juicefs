@@ -28,6 +28,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -80,14 +82,40 @@ func main() {
 	}
 	if *token == "" {
 		logger.Warnf("QoS counter service is running without a token; restrict the listen address to a trusted network")
+	} else {
+		logger.Infof("qosd: bearer token authentication enabled")
 	}
+
+	counter := qos.NewCounter()
+	go heartbeat(counter, 10*time.Second)
+
 	srv := &http.Server{
-		Handler:           qos.NewCounter().Handler(*token),
+		Handler:           counter.Handler(*token),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	logger.Infof("juicefs-qosd %s listening on %s (log-level=%s)", version.Version(), *listen, *logLevel)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		s := <-sig
+		logger.Infof("qosd: received %s, shutting down", s)
+		_ = srv.Close()
+	}()
+
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		logger.Fatalf("serve: %s", err)
+	}
+	logger.Infof("qosd: stopped")
+}
+
+// heartbeat logs a periodic counter summary, so a quiet service still makes
+// its state visible at the default log level.
+func heartbeat(c *qos.Counter, every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for range ticker.C {
+		logger.Infof("qosd: %s", c.Stats())
 	}
 }

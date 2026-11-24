@@ -119,6 +119,41 @@ juicefs-qosd --log-level bogus
 `juicefs qosd` 子命令仍然保留，行为一致（日志级别用全局 `juicefs --log-level`）。
 测试脚本会自动优先使用 `juicefs-qosd`，找不到时回退到 `juicefs qosd`。
 
+### 3.2 qos.sh：策略运维助手
+
+测试包提供 `qos.sh`，用于查看和修改策略文件（`policy.json`），修改后自动向挂载进程发 `SIGUSR1` 完成热加载，无需重新挂载：
+
+```bash
+./qos.sh show                     # 打印策略 JSON + 最近一次加载日志
+./qos.sh list                     # 每条规则一行（带宽按 MiB/GiB 显示）
+./qos.sh cap --bandwidth 100M --iops 5000 --meta-iops 2000
+./qos.sh set /proj-a --bandwidth 20M --meta-iops 50
+./qos.sh set /proj-b --bandwidth 10M --read-bandwidth 8M
+./qos.sh del /proj-b
+./qos.sh reload                   # 只发 SIGUSR1 并校验 "QoS policy reloaded"
+./qos.sh check                    # 等价于 ./test.sh
+```
+
+- 限速参数：`--bandwidth/--read-bandwidth/--write-bandwidth`（速率，支持 `B/K/M/G/T/P` 后缀、1024 进制，裸数字为字节/秒）、`--iops/--read-iops/--write-iops`、`--meta-iops`、`--meta-lookup/--meta-getattr/--meta-create/--meta-unlink/--meta-readdir/--meta-statfs`。
+- 编辑采用临时文件 + `os.replace` 原子写入，`version` 自增；只修改本次给出的字段，其余规则保持不变。
+- `mount.sh` 在挂载时会把包内的 `policy.json` 覆盖到 `$BASE/policy.json`；重新格式化/重挂后需要重新执行 `qos.sh set` 或直接编辑 `$BASE/policy.json`。
+- 依赖可用的 `python3`；脚本探测 `/opt/homebrew/bin/python3`、`/usr/local/bin/python3`，也可用 `PY=/path/to/python3` 指定（系统自带的 `/usr/bin/python3` 在 Xcode 损坏的机器上不可用）。
+
+### 3.3 qosd 日志
+
+默认 `--log-level=info` 记录状态变化；`debug` 追加每次请求的明细：
+
+| 事件 | 级别 | 示例 |
+| --- | --- | --- |
+| 启动/监听 | info | `juicefs-qosd ... listening on 127.0.0.1:19567 (log-level=info)` |
+| 鉴权开启 | info | `qosd: bearer token authentication enabled` |
+| 新建/更新桶 | info | `qosd: created bucket tenant=t1 ino=20 dim=metaIOPS rate=50 burst=5` |
+| 周期汇总 | info（每 10s） | `qosd: tenants=1 buckets=6 grants=120 denied=3 granted_tokens=...` |
+| 授予令牌 | debug | `qosd: grant tenant=t1 dim=bandwidth want=2097152 granted=2097152 levels=20:20971520,0:104857600` |
+| 请求被限流 | debug | `qosd: request throttled ...`（`denied` 计数随心跳汇总） |
+| HTTP 错误 | warn | `qosd: rejected POST /v1/grant from ...: bad token` |
+| 收到信号/退出 | info | `qosd: received terminated, shutting down` / `qosd: stopped` |
+
 ## 4. 测试
 
 `../juicefs-multitenant-qos-test/`（仓库外）提供脚本化验收：

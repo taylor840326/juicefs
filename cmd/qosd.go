@@ -19,6 +19,7 @@ package cmd
 import (
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/qos"
 	"github.com/urfave/cli/v2"
@@ -65,12 +66,21 @@ func qosdAction(c *cli.Context) error {
 		token = os.Getenv("JFS_QOSD_TOKEN")
 	}
 	counter := qos.NewCounter()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			logger.Infof("qosd: %s", counter.Stats())
+		}
+	}()
 	srv := &http.Server{
 		Addr:    listen,
 		Handler: counter.Handler(token),
 	}
 	if token == "" {
 		logger.Warnf("QoS counter service is running without a token; restrict the listen address to a trusted network")
+	} else {
+		logger.Infof("qosd: bearer token authentication enabled")
 	}
 	logger.Infof("QoS counter service is listening on %s", listen)
 	return srv.ListenAndServe()

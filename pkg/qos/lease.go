@@ -112,11 +112,38 @@ func (c *HTTPLeaseClient) Grant(ctx context.Context, tenant string, levels []Lea
 type Counter struct {
 	mu      sync.Mutex
 	buckets map[string]*tokenBucket
+	tenants map[string]struct{}
+
+	grants uint64
+	denied uint64
+	tokens uint64
 }
 
 // NewCounter creates an empty counter.
 func NewCounter() *Counter {
-	return &Counter{buckets: make(map[string]*tokenBucket)}
+	return &Counter{
+		buckets: make(map[string]*tokenBucket),
+		tenants: make(map[string]struct{}),
+	}
+}
+
+// Stats returns a one-line summary used by the periodic qosd heartbeat.
+func (c *Counter) Stats() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return fmt.Sprintf("tenants=%d buckets=%d grants=%d denied=%d granted_tokens=%d",
+		len(c.tenants), len(c.buckets), c.grants, c.denied, c.tokens)
+}
+
+func levelsText(levels []LeaseLevel) string {
+	var sb strings.Builder
+	for i, l := range levels {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		_, _ = fmt.Fprintf(&sb, "%d:%d", l.Ino, l.Rate)
+	}
+	return sb.String()
 }
 
 func counterKey(tenant string, ino uint64, dim string) string {
@@ -127,7 +154,15 @@ func (c *Counter) bucketLocked(tenant string, l LeaseLevel, dim string) *tokenBu
 	key := counterKey(tenant, l.Ino, dim)
 	burst := burstFor(l.Rate)
 	b := c.buckets[key]
-	if b == nil || b.rate != float64(l.Rate) || b.burst != float64(burst) {
+	if b == nil {
+		b = newTokenBucket(l.Rate, burst, true)
+		c.buckets[key] = b
+		c.tenants[tenant] = struct{}{}
+		logger.Infof("qosd: created bucket tenant=%s ino=%d dim=%s rate=%d burst=%d",
+			tenant, l.Ino, dim, l.Rate, burst)
+	} else if b.rate != float64(l.Rate) || b.burst != float64(burst) {
+		logger.Infof("qosd: updated bucket tenant=%s ino=%d dim=%s rate=%d->%d burst=%d->%d",
+			tenant, l.Ino, dim, int64(b.rate), l.Rate, int64(b.burst), burst)
 		b = newTokenBucket(l.Rate, burst, true)
 		c.buckets[key] = b
 	}
@@ -141,6 +176,8 @@ func (c *Counter) bucketLocked(tenant string, l LeaseLevel, dim string) *tokenBu
 // each chain only sees its own buckets.
 func (c *Counter) Grant(tenant string, levels []LeaseLevel, dim string, want int64) int64 {
 	if want <= 0 || len(levels) == 0 {
+		logger.Debugf("qosd: grant ignored tenant=%s dim=%s want=%d levels=%s (empty request)",
+			tenant, dim, want, levelsText(levels))
 		return 0
 	}
 	c.mu.Lock()
@@ -153,6 +190,7 @@ func (c *Counter) Grant(tenant string, levels []LeaseLevel, dim string, want int
 		buckets = append(buckets, c.bucketLocked(tenant, l, dim))
 	}
 	if len(buckets) == 0 {
+		logger.Debugf("qosd: grant unlimited tenant=%s dim=%s want=%d", tenant, dim, want)
 		return want
 	}
 	granted := want
@@ -162,6 +200,9 @@ func (c *Counter) Grant(tenant string, levels []LeaseLevel, dim string, want int
 		}
 	}
 	if granted <= 0 {
+		c.denied++
+		logger.Debugf("qosd: grant denied tenant=%s dim=%s want=%d levels=%s (no tokens)",
+			tenant, dim, want, levelsText(levels))
 		return 0
 	}
 	for _, b := range buckets {
@@ -171,6 +212,10 @@ func (c *Counter) Grant(tenant string, levels []LeaseLevel, dim string, want int
 			granted = got
 		}
 	}
+	c.grants++
+	c.tokens += uint64(granted)
+	logger.Debugf("qosd: grant tenant=%s dim=%s want=%d granted=%d levels=%s",
+		tenant, dim, want, granted, levelsText(levels))
 	return granted
 }
 
@@ -179,29 +224,43 @@ func (c *Counter) Grant(tenant string, levels []LeaseLevel, dim string, want int
 func (c *Counter) Handler(token string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
+		logger.Debugf("qosd: GET /v1/healthz from %s", r.RemoteAddr)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/v1/grant", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
+			logger.Warnf("qosd: rejected %s /v1/grant from %s: method not allowed", r.Method, r.RemoteAddr)
 			w.Header().Set("Allow", "POST")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if token != "" && !checkToken(r, token) {
+			logger.Warnf("qosd: rejected %s /v1/grant from %s: bad token", r.Method, r.RemoteAddr)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		var req grantRequest
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			logger.Warnf("qosd: invalid grant request from %s: %s", r.RemoteAddr, err)
 			http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		if req.Tenant == "" || req.Dim == "" || len(req.Levels) == 0 {
+			logger.Warnf("qosd: invalid grant request from %s: tenant, dim and levels are required", r.RemoteAddr)
 			http.Error(w, "tenant, dim and levels are required", http.StatusBadRequest)
 			return
 		}
+		logger.Debugf("qosd: POST /v1/grant from %s tenant=%s dim=%s want=%d levels=%s",
+			r.RemoteAddr, req.Tenant, req.Dim, req.Want, levelsText(req.Levels))
 		out := grantResponse{Granted: c.Grant(req.Tenant, req.Levels, req.Dim, req.Want)}
+		if out.Granted == 0 {
+			// Throttling is a steady-state event; the heartbeat summary already
+			// reports the denied counter, so keep the per-request line at debug
+			// to avoid flooding the log during a long scan.
+			logger.Debugf("qosd: request throttled tenant=%s dim=%s want=%d levels=%s",
+				req.Tenant, req.Dim, req.Want, levelsText(req.Levels))
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out)
 	})
