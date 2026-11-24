@@ -105,3 +105,26 @@ juicefs mount sqlite3:///data/meta.db /mnt/jfs \
 - 策略快照签名/防篡改（当前依赖 `qosd` 的 token 与网络隔离）。
 - 元数据分类之外的更多 op 类别、每个 inode 的例外规则。
 - 真实元数据引擎上的多客户端一致性验证（本阶段用 sqlite3 单机两挂载验证共享预算）。
+
+## 6. 验收结果（macOS 实测，2026-11-24）
+
+测试环境：`sqlite3` 元数据 + `file` 对象存储，单机两个挂载（`mnt`、`mnt2`），
+`qosd` 监听 `127.0.0.1:19567`；策略见测试包 `policy.json`（租户 cap 100 MiB/s，
+`/proj-a` 20 MiB/s + metaIOPS 50，`/proj-b` 10 MiB/s）。
+
+| 检查 | 结果 |
+| --- | --- |
+| SIGUSR1 后 `QoS policy reloaded` 日志、路径解析为 inode | 通过 |
+| `/proj-a` 写 200 MiB | 9.99 s ≈ 20.0 MiB/s |
+| `/proj-b` 写 100 MiB（严格分区，不借兄弟额度） | 9.97 s ≈ 10.0 MiB/s |
+| `rename /proj-a -> /proj-a-renamed` 后写 100 MiB | 4.95 s ≈ 20.2 MiB/s |
+| `/proj-a-renamed` 200 次 `stat`（metaIOPS 50） | 4.14 s ≈ 50 次/s |
+| `qosd` 停机时 fail-open 写 256 MiB | 2.03 s，日志含 lease 失败告警 |
+| 两个挂载并行各写 100 MiB 到 `/proj-b`（共享预算） | 19.92 s ≈ 10.0 MiB/s（合计） |
+
+排障记录：policy 模式最初挂载点报 EIO。根因是 **FUSE 请求上下文的 `Err()` 恒为
+`syscall.EINTR`**（`pkg/fuse/context.go` 的设计：取消要通过 `Canceled()` 判断，
+且前 1 秒内恒为 false），而 `Manager.Charge` 之前用 `ctx.Err()` 判取消，导致每个
+元数据操作都被当成已取消，直接返回 EINTR。改为优先使用 `Canceled()`（普通
+`context.Context` 回退到 `Err()`），并去掉对 `ctx.Done()` 的 select（FUSE 上下文
+未实现该通道）。修复提交：`597f8ec`。
