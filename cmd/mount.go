@@ -297,12 +297,45 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 	if qosConf := getQoSConf(c); qosConf != nil {
 		cfg.QoS = qosConf
 	}
+	qosPolicy, qosMgr = nil, nil
+	if path := c.String("qos-policy-file"); path != "" {
+		if p, err := qos.LoadPolicyFile(path); err != nil {
+			logger.Warnf("load QoS policy %s: %s", path, err)
+		} else {
+			qosPolicy = p
+			var lease qos.LeaseClient
+			if u := c.String("qos-lease-url"); u != "" {
+				lease = qos.NewHTTPLeaseClient(u, c.String("qos-lease-token"))
+			}
+			qosMgr = qos.NewManager(p.Tenant, lease, c.Bool("qos-fail-open"))
+			logger.Infof("QoS policy enabled: tenant=%s version=%d rules=%d shared-budget=%v",
+				p.Tenant, p.Version, len(p.Rules), lease != nil)
+		}
+	}
 
 	skip_check := os.Getenv("SKIP_BACKUP_META_CHECK") == "true"
 	if !skip_check && cfg.BackupMeta > 0 && cfg.BackupMeta < time.Minute*5 {
 		logger.Fatalf("backup-meta should not be less than 5 minutes: %s", cfg.BackupMeta)
 	}
 	return cfg
+}
+
+// lookupMetaPath resolves a slash separated path relative to the mounted root.
+// It is used to bind policy rules that are written with paths instead of inodes.
+func lookupMetaPath(m meta.Meta, path string) (uint64, error) {
+	ino := meta.RootInode
+	for _, name := range strings.Split(strings.Trim(path, "/"), "/") {
+		if name == "" || name == "." {
+			continue
+		}
+		var inode meta.Ino
+		var attr meta.Attr
+		if st := m.Lookup(meta.Background(), ino, name, &inode, &attr, false); st != 0 {
+			return 0, st
+		}
+		ino = inode
+	}
+	return uint64(ino), nil
 }
 
 // getQoSConf builds the client QoS configuration from command line flags and,
@@ -556,6 +589,17 @@ func getDefaultLogDir() string {
 // is kept so that the SIGUSR1 handler can reload the limits at runtime.
 var qosConfigFile string
 
+// qosPolicyFile is the value of --qos-policy-file. The policy is shared by all
+// clients of the tenant and is reloaded on SIGUSR1.
+var qosPolicyFile string
+
+// qosPolicy and qosMgr are the policy snapshot and the limiter of the current
+// mount process. They are built in getVfsConf and installed after NewVFS.
+var (
+	qosPolicy *qos.Policy
+	qosMgr    *qos.Manager
+)
+
 // The QoS HTTP API is served on the metrics address. It is only registered by
 // the mount process, the only client that owns a VFS; gateway/webdav/mdtest
 // run on pkg/fs and therefore have no runtime limits to expose.
@@ -567,6 +611,7 @@ var (
 func mount(c *cli.Context) error {
 	setup(c, 2)
 	qosConfigFile = c.String("qos-config")
+	qosPolicyFile = c.String("qos-policy-file")
 	addr := c.Args().Get(0)
 	removePassword(addr)
 	mp := c.Args().Get(1)
@@ -705,7 +750,20 @@ func mount(c *cli.Context) error {
 		updateFormat(c)(fmt)
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
+	if qosPolicy != nil {
+		if err := qosPolicy.ResolvePaths(func(path string) (uint64, error) {
+			return lookupMetaPath(metaCli, path)
+		}, logger.Warnf); err != nil {
+			logger.Warnf("resolve QoS policy paths: %s", err)
+		}
+	}
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	if qosPolicy != nil {
+		v.SetQoSPolicy(qosPolicy)
+	}
+	if qosMgr != nil {
+		v.SetQoSManager(qosMgr)
+	}
 	qosHTTPBackend.Store(v)
 	qosHTTPOnce.Do(func() {
 		token := c.String("qos-http-token")

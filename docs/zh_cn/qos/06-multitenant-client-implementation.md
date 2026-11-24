@@ -1,0 +1,107 @@
+# 多租户 QoS 客户端实现（P0）
+
+本文记录 `docs/zh_cn/qos/05-multitenant-implementation.md` 中 P0 阶段的落地结果：
+客户端侧的策略解析、目录级限流、层级桶、共享计数服务、运行时重载与测试方式。
+控制面（策略存储、申请审批、预算准入、审计）仍是 P1，本文只描述客户端如何消费
+一份已经生成好的策略快照。
+
+## 1. 已实现的能力
+
+| 需求 | 实现位置 | 说明 |
+|---|---|---|
+| F1 卷级 QoS | `qos.Manager` + tenant `cap` | 策略里的 `cap` 是最后一道总闸，未命中任何规则的路径都继承它 |
+| F2 目录级 QoS | `pkg/vfs/qos_policy.go` `qosScope` | 从操作目标的 inode 向上找最近带规则的祖先，命中谁的规则就用谁的配额 |
+| F3 跨客户端共享 | `cmd/qosd.go` + `pkg/qos/lease.go` | 各挂载进程向同一个 `qosd` 按需申请令牌，父子桶一起扣，Σ 子目录 ≤ 租户 cap |
+| F4 严格分区 | `Manager.chargeLocal` / `Counter.Grant` | 子规则的桶独立，顺序消耗；兄弟目录剩余额度不会被借用 |
+| F5 读写带宽 | `Limits.ReadBandwidth/WriteBandwidth` | 方向桶优先，未设置时回退到共享 `bandwidth` |
+| F6 数据 IOPS | `Limits.IOPS/ReadIOPS/WriteIOPS` | 每次数据操作先扣 1 个 IOPS，再按字节扣带宽 |
+| F7 元数据 IOPS | `Limits.MetaIOPS` | 所有受控元数据操作共享一个桶 |
+| F8 元数据分类 | `Limits.MetaOps` + `MetaDim()` | lookup/getattr/create/unlink/readdir/statfs 各自独立桶，和总桶叠加 |
+| F9 运行时热更新 | `SetQoSPolicy` / `SIGUSR1` | 重新加载策略文件并解析路径，epoch 递增使 scope 缓存失效 |
+| F10 fail-open | `--qos-fail-open`（默认 true） | 计数服务不可用时放行并告警；设 false 则返回 EINTR/EIO |
+| F11 兼容/零开销 | `qosScope` 提前返回 | 未配置策略且没有旧 `--qos-*` 参数时不走任何额外代码 |
+| F12 观测 | 日志 + `GetQoSPolicy` | `QoS policy loaded/reloaded`、`lease service unavailable` 等 |
+
+## 2. 数据流
+
+```
+策略文件 policy.json
+   │  mount: LoadPolicyFile + ResolvePaths(路径→inode)
+   ▼
+VFS.qosPolicy (atomic)          ── SIGUSR1：重读文件、重建 policy、epoch++
+   │
+   ├─ 元数据操作：qosWaitMeta(ctx, 目标 inode 或父 inode, 类别)
+   │      └─ qosScope(ino)：inode → GetParents → … → 最近规则 + tenant cap
+   │             └─ Manager.Charge：逐级扣桶（本地）或向 qosd 申请（租约）
+   │
+   └─ 数据操作：Open/Create 时把 scope 绑定到 handle
+          └─ Read/Write：qosWaitData(ctx, h, 方向, 字节数)
+                 └─ Manager.Charge（同一个 Scope，不再解析路径）
+```
+
+### 2.1 scope 解析与缓存
+
+- 规则只挂在目录上，解析时从目标 inode 向上，遇到第一个有规则的祖先取它的
+  `Limits`，继续向上可命中更多规则，最后追加 `cap`。
+- 结果缓存在 `scopeCache`（`ino → scope`），带 `epoch`；策略变更与 rename
+  成功后 `epoch++` 并清空缓存，因此移动目录树不会留下旧配额。
+- rename 采用保守失效：只要配置了策略，rename 成功就清缓存（实现上在
+  `VFS.Rename` 成功后调用 `invalidateQoSScopes`）。
+- 文件打开时把 scope 绑到 `handle`，读写路径不重复走 `GetParents`。
+
+### 2.2 层级桶与共享预算
+
+- 本地模式（未配 `--qos-lease-url`）：每个层级一个 token bucket，一次操作
+  从最近规则到 cap 逐级扣；父桶被所有子目录共享，因此「子目录不超过父目录」，
+  但 Σ 子目录可能小于父桶容量（严格分区）。
+- 租约模式：每个维度只扣「最近定义该维度的层级」。该层本地桶没有令牌时，向
+  `qosd` 请求一批（`burst = rate/10`）；`qosd` 对该层级及其所有祖先的桶一起
+  扣减，只有全部足够才发放。这样多个挂载进程共享同一组桶，Σ 子 ≤ 租户 cap
+  由服务端一次性原子扣减保证。
+- `qosd` 重启会重置令牌(相当于短暂放宽)，这是 P0 的已知简化，P1 可持久化桶状态。
+
+### 2.3 元数据分类
+
+- 类别：`lookup / getattr / create / unlink / readdir / statfs`，对应
+  `meta.*` 维度；未归类的操作只吃 `metaIOPS` 总桶。
+- 一次操作同时扣「类别桶 + metaIOPS」；桶的顺序固定，避免死锁。
+- 内部递归（如 `Create` 内部检查权限用的 `Lookup`）在 VFS 层不重复走门控——
+  门控只在 VFS 方法入口调用一次。
+
+## 3. CLI 与装配
+
+```bash
+# 计数服务（每租户/平台一个，默认只监听本机）
+juicefs qosd --listen 127.0.0.1:19567 --token "$JFS_QOSD_TOKEN"
+
+# 挂载：策略文件 + 租约 + fail-open
+juicefs mount sqlite3:///data/meta.db /mnt/jfs \
+  --qos-policy-file /etc/juicefs/policy.json \
+  --qos-lease-url http://127.0.0.1:19567 \
+  --qos-lease-token "$JFS_QOSD_TOKEN" \
+  --qos-fail-open=true
+```
+
+- 策略文件路径在**挂载时**读入，`SIGUSR1` 重读；CSI 场景用 ConfigMap 挂载 +
+  `kill -USR1` 即可热更新。
+- 旧的客户端级参数（`--qos-bandwidth` 等）继续可用，与策略叠加；两者都未配置
+  时没有任何额外开销。
+
+## 4. 测试
+
+`../juicefs-multitenant-qos-test/`（仓库外）提供脚本化验收：
+`qosd.sh` → `mount.sh` → `test.sh`，以及双挂载的 `mount2.sh` + `shared-test.sh`。
+细节见该目录的 `README.md`。
+
+单元测试：`go test ./pkg/qos/`（策略解析、维度组合、预算校验、本地严格分区、
+租约共享、fail-open、计数服务 HTTP 鉴权）。
+
+## 5. 与 P1 的边界
+
+以下内容不在本阶段，属于控制面（05 文档的 P1）：
+
+- 策略存储、版本发布、审批流、预算准入（`ValidateBudget` 已提供函数，未接 API）。
+- 租户/目录用量上报与审计、额度借用（P2）。
+- 策略快照签名/防篡改（当前依赖 `qosd` 的 token 与网络隔离）。
+- 元数据分类之外的更多 op 类别、每个 inode 的例外规则。
+- 真实元数据引擎上的多客户端一致性验证（本阶段用 sqlite3 单机两挂载验证共享预算）。

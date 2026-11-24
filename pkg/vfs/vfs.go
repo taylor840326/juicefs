@@ -173,7 +173,7 @@ var (
 )
 
 func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, qos.MetaLookup); err != 0 {
 		return
 	}
 	var inode Ino
@@ -206,7 +206,7 @@ func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, e
 }
 
 func (v *VFS) GetAttr(ctx Context, ino Ino, opened uint8) (entry *meta.Entry, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, qos.MetaGetattr); err != 0 {
 		return
 	}
 	if IsSpecialNode(ino) && getInternalNode(ino) != nil {
@@ -244,7 +244,7 @@ func get_filetype(mode uint16) uint8 {
 }
 
 func (v *VFS) Mknod(ctx Context, parent Ino, name string, mode uint16, cumask uint16, rdev uint32) (entry *meta.Entry, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, qos.MetaCreate); err != 0 {
 		return
 	}
 	defer func() {
@@ -275,7 +275,7 @@ func (v *VFS) Mknod(ctx Context, parent Ino, name string, mode uint16, cumask ui
 }
 
 func (v *VFS) Unlink(ctx Context, parent Ino, name string) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, qos.MetaUnlink); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "unlink", err, "(%d,%s)", parent, name) }()
@@ -295,7 +295,7 @@ func (v *VFS) Unlink(ctx Context, parent Ino, name string) (err syscall.Errno) {
 }
 
 func (v *VFS) Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask uint16) (entry *meta.Entry, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, qos.MetaCreate); err != 0 {
 		return
 	}
 	defer func() {
@@ -321,7 +321,7 @@ func (v *VFS) Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask ui
 }
 
 func (v *VFS) Rmdir(ctx Context, parent Ino, name string) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, qos.MetaUnlink); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "rmdir", err, "(%d,%s)", parent, name) }()
@@ -337,7 +337,7 @@ func (v *VFS) Rmdir(ctx Context, parent Ino, name string) (err syscall.Errno) {
 }
 
 func (v *VFS) Symlink(ctx Context, path string, parent Ino, name string) (entry *meta.Entry, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, qos.MetaCreate); err != 0 {
 		return
 	}
 	defer func() {
@@ -363,7 +363,7 @@ func (v *VFS) Symlink(ctx Context, path string, parent Ino, name string) (entry 
 }
 
 func (v *VFS) Readlink(ctx Context, ino Ino) (path []byte, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "readlink", err, "(%d): (%s)", ino, string(path)) }()
@@ -372,7 +372,7 @@ func (v *VFS) Readlink(ctx Context, ino Ino) (path []byte, err syscall.Errno) {
 }
 
 func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newname string, flags uint32) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, ""); err != 0 {
 		return
 	}
 	defer func() {
@@ -398,12 +398,18 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 		v.invalidateDirHandle(parent, name, 0, nil)
 		v.invalidateDirHandle(newparent, newname, 0, nil)
 		v.invalidateDirHandle(newparent, newname, inode, attr)
+		if v.qosPolicy.Load() != nil {
+			// the rule chain of every inode below the renamed subtree may
+			// have changed; drop the resolved scopes so they are computed
+			// again on the next operation.
+			v.invalidateQoSScopes()
+		}
 	}
 	return
 }
 
 func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *meta.Entry, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, newparent, qos.MetaCreate); err != 0 {
 		return
 	}
 	defer func() {
@@ -432,7 +438,7 @@ func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *
 }
 
 func (v *VFS) Opendir(ctx Context, ino Ino, flags uint32) (fh uint64, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, qos.MetaReaddir); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "opendir", err, "(%d) [fh:%d]", ino, fh) }()
@@ -465,7 +471,7 @@ func (v *VFS) UpdateLength(inode Ino, attr *meta.Attr) {
 }
 
 func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plus bool) (entries []*meta.Entry, readAt time.Time, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, qos.MetaReaddir); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "readdir", err, "(%d,%d,%d,%t): (%d)", ino, size, off, plus, len(entries)) }()
@@ -535,7 +541,7 @@ func (v *VFS) Releasedir(ctx Context, ino Ino, fh uint64) int {
 const O_TMPFILE = 020000000
 
 func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask uint16, flags uint32) (entry *meta.Entry, fh uint64, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, parent, qos.MetaCreate); err != 0 {
 		return
 	}
 	defer func() {
@@ -566,7 +572,7 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 	}
 	if err == 0 {
 		v.UpdateLength(inode, attr)
-		fh = v.newFileHandle(inode, attr.Length, flags)
+		fh = v.newFileHandle(inode, attr.Length, flags, v.qosScope(ctx, parent))
 		entry = &meta.Entry{Inode: inode, Attr: attr}
 		v.invalidateDirHandle(parent, name, inode, attr)
 
@@ -581,7 +587,7 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 }
 
 func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh uint64, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() {
@@ -624,14 +630,14 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 	err = v.Meta.Open(ctx, ino, flags, attr)
 	if err == 0 {
 		v.UpdateLength(ino, attr)
-		fh = v.newFileHandle(ino, attr.Length, flags)
+		fh = v.newFileHandle(ino, attr.Length, flags, v.qosScope(ctx, ino))
 		entry = &meta.Entry{Inode: ino, Attr: attr}
 	}
 	return
 }
 
 func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	// defer func() { logit(ctx, "truncate (%d,%d): %s", ino, size, strerr(err)) }()
@@ -835,7 +841,7 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		err = syscall.EBADF
 	}
 	if err == 0 && n > 0 {
-		err = v.waitData(ctx, true, int64(n))
+		err = v.qosWaitData(ctx, h, true, int64(n))
 	}
 	h.removeOp(ctx)
 	return
@@ -891,7 +897,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 	}
 	defer h.Wunlock()
 
-	if err = v.waitData(ctx, false, int64(size)); err != 0 {
+	if err = v.qosWaitData(ctx, h, false, int64(size)); err != 0 {
 		h.removeOp(ctx)
 		return
 	}
@@ -910,7 +916,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 }
 
 func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "fallocate", err, "(%d,%d,%d,%d)", ino, mode, off, size) }()
@@ -1004,7 +1010,7 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		err = syscall.EINVAL // overlap
 		return
 	}
-	if err = v.waitOp(ctx); err != 0 {
+	if err = v.qosWaitCopy(ctx, ho, int64(size)); err != 0 {
 		return
 	}
 
@@ -1042,7 +1048,7 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 }
 
 func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	if ino == controlInode && runtime.GOOS == "darwin" {
@@ -1090,7 +1096,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 }
 
 func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "fsync", err, "(%d,%d)", ino, datasync) }()
@@ -1144,7 +1150,7 @@ func isXattrEnabled(conf *Config, name string) bool {
 }
 
 func (v *VFS) SetXattr(ctx Context, ino Ino, name string, value []byte, flags uint32) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "setxattr", err, "(%d,%s,%d,%d)", ino, name, len(value), flags) }()
@@ -1197,7 +1203,7 @@ func (v *VFS) SetXattr(ctx Context, ino Ino, name string, value []byte, flags ui
 }
 
 func (v *VFS) GetXattr(ctx Context, ino Ino, name string, size uint32) (value []byte, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	if !isXattrEnabled(v.Conf, name) {
@@ -1239,7 +1245,7 @@ func (v *VFS) GetXattr(ctx Context, ino Ino, name string, size uint32) (value []
 }
 
 func (v *VFS) ListXattr(ctx Context, ino Ino, size int) (data []byte, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "listxattr", err, "(%d,%d): (%d)", ino, size, len(data)) }()
@@ -1255,7 +1261,7 @@ func (v *VFS) ListXattr(ctx Context, ino Ino, size int) (data []byte, err syscal
 }
 
 func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "removexattr", err, "(%d,%s)", ino, name) }()
@@ -1316,6 +1322,13 @@ type VFS struct {
 	// UpdateQoS); a nil controller means "unlimited".
 	qos   atomic.Pointer[qos.Controller]
 	qosMu sync.Mutex
+
+	// multi-tenant policy based limits (see qos_policy.go); qosPolicy is
+	// swapped atomically and qosEpoch invalidates cached scopes.
+	qosPolicy     atomic.Pointer[qos.Policy]
+	qosMgr        *qos.Manager
+	qosEpoch      atomic.Uint64
+	qosScopeCache *scopeCache
 }
 
 func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer prometheus.Registerer, registry *prometheus.Registry) *VFS {
@@ -1336,6 +1349,7 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		registry:    registry,
 	}
 	v.qos.Store(qos.New(conf.QoS))
+	v.qosScopeCache = &scopeCache{entries: make(map[meta.Ino]scopeEntry, 64)}
 
 	n := getInternalNode(ConfigInode)
 	v.Conf.Format.RemoveSecret()

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/qos"
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
@@ -46,6 +47,10 @@ type handle struct {
 	reader     FileReader
 	writer     FileWriter
 	ops        []Context
+
+	// scope pins the QoS rule chain of this file, so a read or write does
+	// not walk the directory tree again.
+	scope *qos.Scope
 
 	// rwlock
 	writing uint32
@@ -234,11 +239,12 @@ func (v *VFS) releaseHandle(inode Ino, fh uint64) {
 	}
 }
 
-func (v *VFS) newFileHandle(inode Ino, length uint64, flags uint32) uint64 {
+func (v *VFS) newFileHandle(inode Ino, length uint64, flags uint32, scope *qos.Scope) uint64 {
 	h := v.newHandle(inode, (flags&O_ACCMODE) == syscall.O_RDONLY)
 	h.Lock()
 	defer h.Unlock()
 	h.flags = flags
+	h.scope = scope
 	switch flags & O_ACCMODE {
 	case syscall.O_RDONLY:
 		h.reader = v.reader.Open(inode, length)

@@ -345,6 +345,23 @@ func qosFlags() []cli.Flag {
 			Name:  "qos-http-token",
 			Usage: "token required by the QoS HTTP API served on the metrics address; empty disables the API (can also be set with JFS_QOS_HTTP_TOKEN)",
 		},
+		&cli.StringFlag{
+			Name:  "qos-policy-file",
+			Usage: "path of the tenant QoS policy (JSON) shared by all clients; reloaded on SIGUSR1",
+		},
+		&cli.StringFlag{
+			Name:  "qos-lease-url",
+			Usage: "URL of the QoS counter service (juicefs qosd) used to share the tenant budget between mounts",
+		},
+		&cli.StringFlag{
+			Name:  "qos-lease-token",
+			Usage: "bearer token for the QoS counter service (can also be set with JFS_QOSD_TOKEN)",
+		},
+		&cli.BoolFlag{
+			Name:  "qos-fail-open",
+			Value: true,
+			Usage: "let I/O through when the QoS counter service is unavailable (default: true)",
+		},
 	})
 }
 

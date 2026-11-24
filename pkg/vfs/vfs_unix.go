@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/qos"
 	"github.com/juicedata/juicefs/pkg/utils"
 
 	"golang.org/x/sys/unix"
@@ -43,7 +44,7 @@ type Statfs struct {
 }
 
 func (v *VFS) StatFS(ctx Context, ino Ino) (st *Statfs, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, qos.MetaStatfs); err != 0 {
 		return
 	}
 	var totalspace, availspace, iused, iavail uint64
@@ -78,7 +79,7 @@ func accessTest(attr *Attr, mmode uint16, uid uint32, gid uint32) syscall.Errno 
 }
 
 func (v *VFS) Access(ctx Context, ino Ino, mask int) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() { logit(ctx, "access", err, "(%d,0x%X)", ino, mask) }()
@@ -148,7 +149,7 @@ func setattrStr(set int, mode, uid, gid uint32, atime, mtime int64, size uint64)
 }
 
 func (v *VFS) SetAttr(ctx Context, ino Ino, set int, fh uint64, mode, uid, gid uint32, atime, mtime int64, atimensec, mtimensec uint32, size uint64) (entry *meta.Entry, err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	str := setattrStr(set, mode, uid, gid, atime, mtime, size)
@@ -231,7 +232,7 @@ func (l lockType) String() string {
 }
 
 func (v *VFS) Getlk(ctx Context, ino Ino, fh uint64, owner uint64, start, len *uint64, typ *uint32, pid *uint32) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() {
@@ -253,7 +254,7 @@ func (v *VFS) Getlk(ctx Context, ino Ino, fh uint64, owner uint64, start, len *u
 }
 
 func (v *VFS) Setlk(ctx Context, ino Ino, fh uint64, owner uint64, start, end uint64, typ uint32, pid uint32, block bool) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	defer func() {
@@ -289,7 +290,7 @@ func (v *VFS) Setlk(ctx Context, ino Ino, fh uint64, owner uint64, start, end ui
 }
 
 func (v *VFS) Flock(ctx Context, ino Ino, fh uint64, owner uint64, typ uint32, block bool) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	var name string
@@ -332,7 +333,7 @@ func (v *VFS) Flock(ctx Context, ino Ino, fh uint64, owner uint64, typ uint32, b
 }
 
 func (v *VFS) Ioctl(ctx Context, ino Ino, cmd uint32, arg uint64, bufIn, bufOut []byte) (err syscall.Errno) {
-	if err = v.waitMeta(ctx); err != 0 {
+	if err = v.qosWaitMeta(ctx, ino, ""); err != 0 {
 		return
 	}
 	const (

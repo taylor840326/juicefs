@@ -192,17 +192,33 @@ func printQoS(conf *qos.Config) {
 // It is triggered by SIGUSR1, which lets operators tune the limits of a mount
 // without restarting it (for example after a ConfigMap update).
 func reloadQoS(v *vfs.VFS) {
-	if qosConfigFile == "" {
-		logger.Warnf("received SIGUSR1 but --qos-config is not set, ignore")
+	if qosConfigFile == "" && qosPolicyFile == "" {
+		logger.Warnf("received SIGUSR1 but neither --qos-config nor --qos-policy-file is set, ignore")
 		return
 	}
-	u, err := loadQoSFile(qosConfigFile)
-	if err != nil {
-		logger.Warnf("reload QoS config %s: %s", qosConfigFile, err)
-		return
+	if qosConfigFile != "" {
+		if u, err := loadQoSFile(qosConfigFile); err != nil {
+			logger.Warnf("reload QoS config %s: %s", qosConfigFile, err)
+		} else {
+			v.UpdateQoS(*u)
+			logger.Infof("QoS config reloaded from %s", qosConfigFile)
+		}
 	}
-	v.UpdateQoS(*u)
-	logger.Infof("QoS config reloaded from %s", qosConfigFile)
+	if qosPolicyFile != "" {
+		p, err := qos.LoadPolicyFile(qosPolicyFile)
+		if err != nil {
+			logger.Warnf("reload QoS policy %s: %s", qosPolicyFile, err)
+			return
+		}
+		if err := p.ResolvePaths(func(path string) (uint64, error) {
+			return lookupMetaPath(v.Meta, path)
+		}, logger.Warnf); err != nil {
+			logger.Warnf("resolve QoS policy paths: %s", err)
+		}
+		v.SetQoSPolicy(p)
+		qosPolicy = p
+		logger.Infof("QoS policy reloaded from %s (version=%d rules=%d)", qosPolicyFile, p.Version, len(p.Rules))
+	}
 }
 
 // loadQoSFile reads a JSON file with QoS limits. The bandwidth fields accept
