@@ -18,6 +18,7 @@ package qos
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -26,6 +27,12 @@ import (
 )
 
 var logger = utils.GetLogger("juicefs")
+
+// ErrStale is returned by ChargeWatch when the policy changed while the caller
+// was blocked. The caller is expected to resolve its scope again and retry, so
+// that a rule update takes effect for operations that are already waiting
+// instead of letting them drain the old buckets.
+var ErrStale = errors.New("qos policy changed while waiting")
 
 // Level is one node of a scope chain: the directory inode that owns a rule
 // and the limits of that rule. The tenant cap is the last level with inode 0.
@@ -157,26 +164,33 @@ func canceled(ctx context.Context) bool {
 // Charge blocks until op is allowed by the policy and consumes its tokens.
 // A nil scope or an empty chain means "no policy", i.e. unlimited.
 func (m *Manager) Charge(ctx context.Context, s *Scope, op Op) error {
+	return m.ChargeWatch(ctx, s, op, nil)
+}
+
+// ChargeWatch is Charge with a staleness probe. stale is called at every wait
+// iteration; when it reports true, ChargeWatch gives up with ErrStale so the
+// caller can re-resolve the scope and retry under the new policy.
+func (m *Manager) ChargeWatch(ctx context.Context, s *Scope, op Op, stale func() bool) error {
 	if m == nil || s == nil || len(s.Chain) == 0 {
 		return nil
 	}
 	if m.lease != nil {
-		return m.chargeLeased(ctx, s, op)
+		return m.chargeLeased(ctx, s, op, stale)
 	}
-	return m.chargeLocal(ctx, s, op)
+	return m.chargeLocal(ctx, s, op, stale)
 }
 
 // chargeLocal charges every level of the chain independently. Sibling
 // directories therefore share their parent level's tokenBucket, which gives
 // hierarchical enforcement without a counter service.
-func (m *Manager) chargeLocal(ctx context.Context, s *Scope, op Op) error {
+func (m *Manager) chargeLocal(ctx context.Context, s *Scope, op Op, stale func() bool) error {
 	for _, lv := range s.Chain {
 		for _, dr := range lv.Limits.dimensionReqs(op) {
 			rate := lv.Limits.Rate(dr.Dim)
 			if rate == 0 {
 				continue
 			}
-			if err := m.waitLocal(ctx, keyOf(lv.Ino, dr.Dim), rate, dr.N); err != nil {
+			if err := m.waitLocal(ctx, keyOf(lv.Ino, dr.Dim), rate, dr.N, stale); err != nil {
 				return err
 			}
 		}
@@ -184,12 +198,15 @@ func (m *Manager) chargeLocal(ctx context.Context, s *Scope, op Op) error {
 	return nil
 }
 
-func (m *Manager) waitLocal(ctx context.Context, key string, rate uint64, n int64) error {
+func (m *Manager) waitLocal(ctx context.Context, key string, rate uint64, n int64, stale func() bool) error {
 	burst := burstFor(rate)
 	b := m.tokenBucket(key, rate, burst)
 	for n > 0 {
 		if canceled(ctx) {
 			return context.Canceled
+		}
+		if stale != nil && stale() {
+			return ErrStale
 		}
 		chunk := n
 		if chunk > int64(burst) {
@@ -217,7 +234,7 @@ func (m *Manager) waitLocal(ctx context.Context, key string, rate uint64, n int6
 // chargeLeased charges the nearest level that defines each dimension. The
 // grant request carries the whole chain, so the counter deducts every
 // ancestor tokenBucket at once; charging ancestors again here would double count.
-func (m *Manager) chargeLeased(ctx context.Context, s *Scope, op Op) error {
+func (m *Manager) chargeLeased(ctx context.Context, s *Scope, op Op, stale func() bool) error {
 	handled := make(map[string]bool, 4)
 	for i, lv := range s.Chain {
 		for _, dr := range lv.Limits.dimensionReqs(op) {
@@ -225,7 +242,7 @@ func (m *Manager) chargeLeased(ctx context.Context, s *Scope, op Op) error {
 				continue
 			}
 			handled[dr.Dim] = true
-			if err := m.waitLeased(ctx, s.Chain, i, dr.Dim, dr.N); err != nil {
+			if err := m.waitLeased(ctx, s.Chain, i, dr.Dim, dr.N, stale); err != nil {
 				return err
 			}
 		}
@@ -233,7 +250,7 @@ func (m *Manager) chargeLeased(ctx context.Context, s *Scope, op Op) error {
 	return nil
 }
 
-func (m *Manager) waitLeased(ctx context.Context, chain []Level, idx int, dim string, n int64) error {
+func (m *Manager) waitLeased(ctx context.Context, chain []Level, idx int, dim string, n int64, stale func() bool) error {
 	rate := chain[idx].Limits.Rate(dim)
 	if rate == 0 {
 		return nil
@@ -254,6 +271,9 @@ func (m *Manager) waitLeased(ctx context.Context, chain []Level, idx int, dim st
 	for n > 0 {
 		if canceled(ctx) {
 			return context.Canceled
+		}
+		if stale != nil && stale() {
+			return ErrStale
 		}
 		chunk := n
 		if chunk > int64(quantum) {

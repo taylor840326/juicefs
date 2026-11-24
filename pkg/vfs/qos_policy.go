@@ -148,87 +148,100 @@ func (v *VFS) qosScope(ctx Context, ino meta.Ino) *qos.Scope {
 // qosWaitMeta charges one metadata operation against the rule of ino. It also
 // honors the legacy client wide limits (--qos-*), so both configurations can
 // coexist while users migrate to a policy file.
-func (v *VFS) qosWaitMeta(ctx Context, ino meta.Ino, class string) syscall.Errno {
-	if v.qosMgr != nil {
-		if s := v.qosScope(ctx, ino); s != nil {
-			if err := v.qosMgr.Charge(ctx, s, qos.Op{Meta: class}); err != nil {
-				return errnoOf(err)
-			}
-		}
-	}
-	return v.waitMeta(ctx)
-}
-
-// scopeForHandle returns the scope pinned by the handle. After a policy
-// reload the epoch changes and the chain is resolved again on the next I/O,
-// so limits also reach files that are already open.
+// scopeForHandle returns the scope bound to an open handle. A handle stores the
+// epoch it was resolved at; when a policy reload bumps the epoch, the next I/O
+// of that handle resolves its rule chain again instead of using stale rules.
 func (v *VFS) scopeForHandle(ctx Context, h *handle) *qos.Scope {
 	if h == nil || v.qosMgr == nil {
 		return nil
 	}
-	s := h.scope.Load()
 	epoch := v.qosEpoch.Load()
-	if e := h.scopeEpoch.Load(); e != epoch {
-		if ns := v.qosScope(ctx, h.inode); ns != nil {
-			h.scope.Store(ns)
-		} else {
-			h.scope.Store(nil)
+	if h.scopeEpoch.Load() == epoch {
+		if s := h.scope.Load(); s != nil {
+			return s
 		}
-		h.scopeEpoch.Store(epoch)
-		s = h.scope.Load()
 	}
+	s := v.qosScope(ctx, h.inode)
+	h.scope.Store(s)
+	h.scopeEpoch.Store(epoch)
 	return s
 }
 
-// qosWaitData charges n bytes of a data operation. The scope was bound to the
-// handle when the file was opened, so charging does not walk the tree for
-// every read or write unless the policy changed in the meantime.
-func (v *VFS) qosWaitData(ctx Context, h *handle, read bool, n int64) syscall.Errno {
-	if n <= 0 {
-		return 0
-	}
-	if s := v.scopeForHandle(ctx, h); s != nil {
-		if err := v.qosMgr.Charge(ctx, s, qos.Op{Read: read, Bytes: n}); err != nil {
-			return errnoOf(err)
-		}
-	}
-	return v.waitData(ctx, read, n)
-}
-
-// qosWaitOp charges one operation without bytes, e.g. a server side copy.
-func (v *VFS) qosWaitOp(ctx Context, ino meta.Ino) syscall.Errno {
-	if v.qosMgr != nil {
-		if s := v.qosScope(ctx, ino); s != nil {
-			if err := v.qosMgr.Charge(ctx, s, qos.Op{}); err != nil {
-				return errnoOf(err)
-			}
-		}
-	}
-	return v.waitOp(ctx)
-}
-
-// errnoOf maps the errors returned by the limiter to an errno. A canceled
-// wait is reported as EINTR so that the interrupted request is retried by the
-// application instead of failing with an unexpected I/O error.
 func errnoOf(err error) syscall.Errno {
-	if err == nil {
-		return 0
-	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return syscall.EINTR
 	}
 	return syscall.EIO
 }
 
-// qosWaitCopy charges the bytes of a server side copy to the destination
-// handle. It keeps the legacy --qos-* behavior (one operation, no bytes) so
-// both configurations stay coherent.
+// qosCharge charges op under the newest policy. If a reload happens while the
+// charge is blocked, the manager aborts it with ErrStale; the scope is resolved
+// again and the operation retries under the new rules.
+func (v *VFS) qosCharge(ctx Context, op qos.Op, resolve func() (*qos.Scope, uint64)) syscall.Errno {
+	if v.qosMgr == nil {
+		return 0
+	}
+	for i := 0; i < 1000; i++ {
+		s, epoch := resolve()
+		if s == nil {
+			return 0
+		}
+		err := v.qosMgr.ChargeWatch(ctx, s, op, func() bool { return v.qosEpoch.Load() != epoch })
+		if err == qos.ErrStale {
+			continue
+		}
+		if err != nil {
+			return errnoOf(err)
+		}
+		return 0
+	}
+	return syscall.EINTR
+}
+
+func (v *VFS) qosWaitMeta(ctx Context, ino meta.Ino, class string) syscall.Errno {
+	if v.qosMgr != nil {
+		if err := v.qosCharge(ctx, qos.Op{Meta: class}, func() (*qos.Scope, uint64) {
+			epoch := v.qosEpoch.Load()
+			return v.qosScope(ctx, ino), epoch
+		}); err != 0 {
+			return err
+		}
+	}
+	return v.waitMeta(ctx)
+}
+
+func (v *VFS) qosWaitData(ctx Context, h *handle, read bool, n int64) syscall.Errno {
+	if n <= 0 {
+		return 0
+	}
+	if err := v.qosCharge(ctx, qos.Op{Read: read, Bytes: n}, func() (*qos.Scope, uint64) {
+		epoch := v.qosEpoch.Load()
+		return v.scopeForHandle(ctx, h), epoch
+	}); err != 0 {
+		return err
+	}
+	return v.waitData(ctx, read, n)
+}
+
+func (v *VFS) qosWaitOp(ctx Context, ino meta.Ino) syscall.Errno {
+	if v.qosMgr != nil {
+		if err := v.qosCharge(ctx, qos.Op{}, func() (*qos.Scope, uint64) {
+			epoch := v.qosEpoch.Load()
+			return v.qosScope(ctx, ino), epoch
+		}); err != 0 {
+			return err
+		}
+	}
+	return v.waitOp(ctx)
+}
+
 func (v *VFS) qosWaitCopy(ctx Context, h *handle, n int64) syscall.Errno {
 	if n > 0 {
-		if s := v.scopeForHandle(ctx, h); s != nil {
-			if err := v.qosMgr.Charge(ctx, s, qos.Op{Bytes: n}); err != nil {
-				return errnoOf(err)
-			}
+		if err := v.qosCharge(ctx, qos.Op{Bytes: n}, func() (*qos.Scope, uint64) {
+			epoch := v.qosEpoch.Load()
+			return v.scopeForHandle(ctx, h), epoch
+		}); err != 0 {
+			return err
 		}
 	}
 	return v.waitOp(ctx)

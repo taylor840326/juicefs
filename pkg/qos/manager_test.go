@@ -332,3 +332,21 @@ func TestCounterAuth(t *testing.T) {
 		t.Fatalf("expected 401, got %d", resp.StatusCode)
 	}
 }
+
+// TestChargeStaleAbortsWait checks that a blocked charge gives up as soon as
+// the policy changes, so the caller can re-resolve its scope.
+func TestChargeStaleAbortsWait(t *testing.T) {
+	lease := &countingLease{latency: 5 * time.Millisecond, perCall: 0} // never grants
+	m := NewManager("t1", lease, false)
+	scope := &Scope{Chain: []Level{{Ino: 100, Limits: Limits{MetaIOPS: 2}}}}
+	start := time.Now()
+	err := m.ChargeWatch(context.Background(), scope, Op{Meta: MetaLookup}, func() bool {
+		return time.Since(start) > 30*time.Millisecond
+	})
+	if err != ErrStale {
+		t.Fatalf("expected ErrStale, got %v", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("aborted too slowly: %v", d)
+	}
+}
