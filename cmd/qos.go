@@ -17,11 +17,13 @@
 package cmd
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/qos"
@@ -197,28 +199,95 @@ func reloadQoS(v *vfs.VFS) {
 		return
 	}
 	if qosConfigFile != "" {
-		if u, err := loadQoSFile(qosConfigFile); err != nil {
-			logger.Warnf("reload QoS config %s: %s", qosConfigFile, err)
-		} else {
-			v.UpdateQoS(*u)
-			logger.Infof("QoS config reloaded from %s", qosConfigFile)
-		}
+		applyQoSConfig(v, qosConfigFile)
 	}
 	if qosPolicyFile != "" {
-		p, err := qos.LoadPolicyFile(qosPolicyFile)
-		if err != nil {
-			logger.Warnf("reload QoS policy %s: %s", qosPolicyFile, err)
-			return
-		}
-		if err := p.ResolvePaths(func(path string) (uint64, error) {
-			return lookupMetaPath(v.Meta, path)
-		}, logger.Warnf); err != nil {
-			logger.Warnf("resolve QoS policy paths: %s", err)
-		}
-		v.SetQoSPolicy(p)
-		qosPolicy = p
-		logger.Infof("QoS policy reloaded from %s (version=%d rules=%d)", qosPolicyFile, p.Version, len(p.Rules))
+		applyQoSPolicy(v, qosPolicyFile)
 	}
+}
+
+// applyQoSConfig reloads the client wide limits (--qos-config). It keeps the
+// running limits untouched when the file is missing or malformed.
+func applyQoSConfig(v *vfs.VFS, path string) bool {
+	u, err := loadQoSFile(path)
+	if err != nil {
+		logger.Warnf("reload QoS config %s: %s", path, err)
+		return false
+	}
+	if u == nil {
+		return false
+	}
+	v.UpdateQoS(*u)
+	logger.Infof("QoS config reloaded from %s", path)
+	return true
+}
+
+// applyQoSPolicy reloads a multi-tenant policy file (--qos-policy-file) and
+// resolves the path based rules against the mounted volume.
+func applyQoSPolicy(v *vfs.VFS, path string) bool {
+	p, err := qos.LoadPolicyFile(path)
+	if err != nil {
+		logger.Warnf("reload QoS policy %s: %s", path, err)
+		return false
+	}
+	if err := p.ResolvePaths(func(path string) (uint64, error) {
+		return lookupMetaPath(v.Meta, path)
+	}, logger.Warnf); err != nil {
+		logger.Warnf("resolve QoS policy paths: %s", err)
+	}
+	v.SetQoSPolicy(p)
+	qosPolicy = p
+	logger.Infof("QoS policy reloaded from %s (version=%d rules=%d)", path, p.Version, len(p.Rules))
+	return true
+}
+
+// qosWatchInterval controls how often the mount process checks the QoS files
+// for changes. A 3s poll keeps the client within a few seconds of the control
+// plane without requiring an operator to send SIGUSR1 after every edit.
+const qosWatchInterval = 3 * time.Second
+
+// watchQoS polls --qos-config and --qos-policy-file, and reloads whichever one
+// changed. Files are compared by content hash, so a touched but unchanged file
+// does not bump the policy epoch and does not disturb running I/O.
+func watchQoS(v *vfs.VFS) {
+	files := []string{qosConfigFile, qosPolicyFile}
+	last := make(map[string][sha256.Size]byte, 2)
+	for _, p := range files {
+		if p == "" {
+			continue
+		}
+		if h, ok := qosFileHash(p); ok {
+			last[p] = h
+		}
+	}
+	ticker := time.NewTicker(qosWatchInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		for _, p := range files {
+			if p == "" {
+				continue
+			}
+			h, ok := qosFileHash(p)
+			if !ok || h == last[p] {
+				continue
+			}
+			last[p] = h
+			logger.Debugf("QoS file %s changed, reloading", p)
+			if p == qosConfigFile {
+				applyQoSConfig(v, p)
+			} else {
+				applyQoSPolicy(v, p)
+			}
+		}
+	}
+}
+
+func qosFileHash(path string) ([sha256.Size]byte, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return [sha256.Size]byte{}, false
+	}
+	return sha256.Sum256(data), true
 }
 
 // loadQoSFile reads a JSON file with QoS limits. The bandwidth fields accept

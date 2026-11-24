@@ -97,6 +97,11 @@ juicefs mount sqlite3:///data/meta.db /mnt/jfs \
 
 - 策略文件路径在**挂载时**读入，`SIGUSR1` 重读；CSI 场景用 ConfigMap 挂载 +
   `kill -USR1` 即可热更新。
+- **自动刷新**：挂载进程每 **3 秒**轮询一次 `--qos-policy-file` / `--qos-config`，
+  按内容 hash 判断是否变化；变化才重载（未变化不递增 epoch，不打扰在跑的 I/O）。
+  因此即使忘记发 `SIGUSR1`，策略编辑也会在 3 秒内生效；`qos.sh` 仍会主动发信号，
+  让修改在毫秒级生效并立即校验日志。编辑策略时应写临时文件再 `rename` 覆盖，
+  避免读到半个文件；读到坏 JSON 时保留旧策略并在日志中告警一次。
 - 旧的客户端级参数（`--qos-bandwidth` 等）继续可用，与策略叠加；两者都未配置
   时没有任何额外开销。
 
@@ -197,6 +202,7 @@ juicefs-qosd --log-level bogus
 | 检查 | 结果 |
 | --- | --- |
 | SIGUSR1 后 `QoS policy reloaded` 日志、路径解析为 inode | 通过 |
+| 不发送 SIGUSR1，直接修改 `policy.json`（version+1）后 3 s 内生效 | 通过（`test.sh` 第 6 项） |
 | `/proj-a` 写 200 MiB | 9.99 s ≈ 20.0 MiB/s |
 | `/proj-b` 写 100 MiB（严格分区，不借兄弟额度） | 9.97 s ≈ 10.0 MiB/s |
 | `rename /proj-a -> /proj-a-renamed` 后写 100 MiB | 4.95 s ≈ 20.2 MiB/s |
